@@ -1,9 +1,10 @@
 """
-BTCUSD 1H backtest - 3 low-frequency trend setups.
-Replaces the old 5m scalp strategies (they all lost to fees).
+BTCUSD daily-window backtest.
+Window = 06:00 IST -> next day 06:00 IST (00:30 UTC -> 00:30 UTC).
+Goal: at least 1 trade per day, max 2, all closed by the window end.
 
 Data: Delta Exchange public candles (no key), fallback Bybit.
-Optional: set env NTFY_TOPIC to get the summary on your phone.
+Result goes to ntfy via env NTFY_TOPIC.
 """
 import os
 import sys
@@ -13,22 +14,35 @@ import numpy as np
 import pandas as pd
 import requests
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG (change numbers here) ----------------
 SYMBOL = "BTCUSD"
-DAYS = 180            # history length
-FEE = 0.0005          # 0.05% per side
-SLIP = 0.0001         # 0.01% per side
-RISK_PER_TRADE = 0.01 # 1% of equity risked per trade (for equity curve)
-MAX_HOLD_BARS = 48    # force exit after 48 hours
-OOS_SPLIT = 0.70      # first 70% in-sample, last 30% out-of-sample
+DAYS = 730             # history length
+TF_MIN = 30            # candle size in minutes
+FEE = 0.0005           # 0.05% per side
+SLIP = 0.0001          # 0.01% per side
+SL_MULT = 0.5          # stop   = 0.5 x average daily range
+TP_MULT = 0.3          # target = 0.3 x average daily range (smaller TP = higher win rate)
+RISK_PER_TRADE = 0.01  # 1% of equity risked per trade (equity curve only)
+MAX_TRADES_PER_DAY = 2
+FORCE_BAR = 24         # setup C: if no trade yet, enter 12h after window start (18:00 IST)
+OOS_SPLIT = 0.70       # first 70% in-sample, last 30% out-of-sample
+WINDOW_START_UTC_MIN = 30   # 06:00 IST = 00:30 UTC
+
+# pass rules
+MIN_TRADES = 150
+MIN_WIN = 60.0
+MIN_PF = 1.2
+MIN_OOS_PF = 1.0
+MIN_COVERAGE = 0.90    # share of days with at least 1 trade
+
+BARS_PER_DAY = 24 * 60 // TF_MIN
 
 
 # ---------------- NTFY ----------------
 def notify(title, message):
     topic = (os.getenv("NTFY_TOPIC") or "").strip()
     if not topic:
-        print("WARNING: NTFY_TOPIC env var is empty - no ntfy notification sent. "
-              "Pass it in the workflow yml (see env: block).")
+        print("WARNING: NTFY_TOPIC env var is empty - no ntfy notification sent.")
         return
     topic = topic.replace("https://ntfy.sh/", "")
     try:
@@ -43,13 +57,13 @@ def notify(title, message):
 def fetch_delta(base):
     end = int(time.time())
     start = end - DAYS * 86400
-    step = 1500 * 3600
+    step = 1500 * TF_MIN * 60
     rows, s = [], start
     while s < end:
         e = min(s + step, end)
         r = requests.get(
             f"{base}/v2/history/candles",
-            params={"resolution": "1h", "symbol": SYMBOL, "start": s, "end": e},
+            params={"resolution": f"{TF_MIN}m", "symbol": SYMBOL, "start": s, "end": e},
             timeout=30,
         )
         r.raise_for_status()
@@ -67,7 +81,7 @@ def fetch_bybit():
     while cur_end > start:
         r = requests.get(
             "https://api.bybit.com/v5/market/kline",
-            params={"category": "linear", "symbol": "BTCUSDT", "interval": "60",
+            params={"category": "linear", "symbol": "BTCUSDT", "interval": str(TF_MIN),
                     "end": cur_end, "limit": 1000},
             timeout=30,
         )
@@ -90,7 +104,7 @@ def load_data():
     ]:
         try:
             df = fn()
-            if len(df) > 500:
+            if len(df) > 2000:
                 print(f"Data source: {name}, {len(df)} candles")
                 df = df.drop_duplicates("time").sort_values("time").set_index("time")
                 return df.astype(float), name
@@ -100,151 +114,162 @@ def load_data():
     sys.exit("No data source worked")
 
 
-# ---------------- INDICATORS ----------------
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def atr(df, n=14):
-    pc = df["close"].shift()
-    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+# ---------------- PREP ----------------
+def prepare(df):
+    df = df.copy()
+    df["win"] = (df.index - pd.Timedelta(minutes=WINDOW_START_UTC_MIN)).floor("D")
+    df["ema_d"] = df["close"].ewm(span=BARS_PER_DAY, adjust=False).mean()
+    g = df.groupby("win")
+    w = pd.DataFrame({
+        "open": g["open"].first(), "high": g["high"].max(),
+        "low": g["low"].min(), "close": g["close"].last(), "n": g.size(),
+    })
+    w = w[w["n"] >= int(BARS_PER_DAY * 0.9)]          # full windows only
+    w["datr"] = (w["high"] - w["low"]).rolling(14).mean().shift(1)   # avg daily range, known at start
+    w["prev_ret"] = (w["close"] / w["open"] - 1).shift(1)            # previous window return
+    ema10 = w["close"].ewm(span=10, adjust=False).mean()
+    w["trend"] = np.where(w["close"].shift(1) > ema10.shift(1), 1, -1)  # trend known at start
+    return df, w
 
 
 # ---------------- SETUPS ----------------
-# Each returns (long_signal, short_signal, sl_atr_mult, tp_atr_mult)
-# Signal on bar close -> entry at next bar open.
-def setup_a_donchian(df):
-    """Donchian 20 breakout, only in direction of EMA200 trend."""
-    e200 = ema(df["close"], 200)
-    hi = df["high"].rolling(20).max().shift()
-    lo = df["low"].rolling(20).min().shift()
-    long = (df["close"] > hi) & (df["close"] > e200)
-    short = (df["close"] < lo) & (df["close"] < e200)
-    return long, short, 1.5, 3.0
+# entry_fn(k, o, h, l, c, e, wi, n_tr) -> direction (1 long, -1 short, 0 none)
+# k = candle index inside the window, entry is at the OPEN of candle k,
+# only data before candle k may be used.
+def setup_a_trend_open(k, o, h, l, c, e, wi, n_tr):
+    """Every day at 06:00 IST trade in the direction of the daily trend."""
+    return int(wi["trend"]) if k == 0 else 0
 
 
-def setup_b_pullback(df):
-    """Trend pullback: EMA50>EMA200, price dips to EMA21 zone, RSI turns up from <45."""
-    c = df["close"]
-    e21, e50, e200 = ema(c, 21), ema(c, 50), ema(c, 200)
-    r = rsi(c)
-    long = (e50 > e200) & (df["low"] <= e21) & (c > e21) & (r.shift() < 45) & (r > r.shift())
-    short = (e50 < e200) & (df["high"] >= e21) & (c < e21) & (r.shift() > 55) & (r < r.shift())
-    return long, short, 1.5, 2.5
+def setup_b_fade_prev_day(k, o, h, l, c, e, wi, n_tr):
+    """Every day at 06:00 IST fade the previous window's move."""
+    if k == 0 and wi["prev_ret"] != 0 and not np.isnan(wi["prev_ret"]):
+        return int(-np.sign(wi["prev_ret"]))
+    return 0
 
 
-def setup_c_squeeze(df):
-    """Bollinger squeeze (width in lowest 20% of last 100 bars) then breakout with trend."""
-    c = df["close"]
-    ma = c.rolling(20).mean()
-    sd = c.rolling(20).std()
-    up, dn = ma + 2 * sd, ma - 2 * sd
-    width = (up - dn) / ma
-    squeezed = width.shift() <= width.rolling(100).quantile(0.2).shift()
-    e100 = ema(c, 100)
-    long = squeezed & (c > up) & (c > e100)
-    short = squeezed & (c < dn) & (c < e100)
-    return long, short, 1.5, 3.0
+def setup_c_trend_pullback(k, o, h, l, c, e, wi, n_tr):
+    """Trade trend on a dip to the daily EMA; if no trade by 18:00 IST, enter anyway."""
+    t = int(wi["trend"])
+    if k >= 1:
+        if t == 1 and l[k - 1] <= e[k - 1]:
+            return 1
+        if t == -1 and h[k - 1] >= e[k - 1]:
+            return -1
+    if k == FORCE_BAR and n_tr == 0:
+        return t
+    return 0
 
 
 SETUPS = {
-    "A_donchian_breakout": setup_a_donchian,
-    "B_trend_pullback": setup_b_pullback,
-    "C_bb_squeeze": setup_c_squeeze,
+    "A_trend_at_6am": setup_a_trend_open,
+    "B_fade_prev_day": setup_b_fade_prev_day,
+    "C_trend_pullback": setup_c_trend_pullback,
 }
 
 
 # ---------------- ENGINE ----------------
-def run(df, long, short, sl_m, tp_m):
-    a = atr(df).values
-    o, h, l, c = (df[k].values for k in ["open", "high", "low", "close"])
-    ls, ss = long.fillna(False).values, short.fillna(False).values
-    idx = df.index
-    n, i, trades = len(df), 0, []
-    while i < n - 2:
-        d = 1 if ls[i] else (-1 if ss[i] else 0)
-        if d == 0 or np.isnan(a[i]):
-            i += 1
+def run(df, w, entry_fn):
+    groups = {k: v for k, v in df.groupby("win")}
+    trades, n_windows = [], 0
+    cost = 2 * (FEE + SLIP)
+    for win, wi in w.iterrows():
+        if np.isnan(wi["datr"]) or win not in groups:
             continue
-        entry = o[i + 1]
-        sl = entry - d * sl_m * a[i]
-        tp = entry + d * tp_m * a[i]
-        risk_pct = sl_m * a[i] / entry
-        exit_px, j = None, i + 1
-        while j < n:
-            hit_sl = l[j] <= sl if d == 1 else h[j] >= sl
-            hit_tp = h[j] >= tp if d == 1 else l[j] <= tp
-            if hit_sl:               # SL first if both hit in same candle (conservative)
-                exit_px = sl
-                break
-            if hit_tp:
-                exit_px = tp
-                break
-            if j - (i + 1) >= MAX_HOLD_BARS:
-                exit_px = c[j]
-                break
-            j += 1
-        if exit_px is None:
-            break
-        net = d * (exit_px - entry) / entry - 2 * (FEE + SLIP)
-        trades.append({"time": idx[i + 1], "dir": d, "net_pct": net, "R": net / risk_pct})
-        i = j
-    return pd.DataFrame(trades)
+        n_windows += 1
+        seg = groups[win]
+        o, h, l, c, e = (seg[x].values for x in ["open", "high", "low", "close", "ema_d"])
+        idx = seg.index
+        m, k, n_tr = len(seg), 0, 0
+        while k < m and n_tr < MAX_TRADES_PER_DAY:
+            d = entry_fn(k, o, h, l, c, e, wi, n_tr)
+            if d == 0:
+                k += 1
+                continue
+            entry = o[k]
+            sl = entry - d * SL_MULT * wi["datr"]
+            tp = entry + d * TP_MULT * wi["datr"]
+            risk_pct = SL_MULT * wi["datr"] / entry
+            exit_px, j = c[m - 1], m - 1          # default: close at window end
+            for jj in range(k, m):
+                hit_sl = l[jj] <= sl if d == 1 else h[jj] >= sl
+                hit_tp = h[jj] >= tp if d == 1 else l[jj] <= tp
+                if hit_sl:                         # SL first if both in one candle (conservative)
+                    exit_px, j = sl, jj
+                    break
+                if hit_tp:
+                    exit_px, j = tp, jj
+                    break
+            net = d * (exit_px - entry) / entry - cost
+            trades.append({"time": idx[k], "dir": d, "net_pct": net, "R": net / risk_pct})
+            n_tr += 1
+            k = j + 1
+    return pd.DataFrame(trades), n_windows
 
 
-def stats(t):
+def stats(t, n_windows=None):
     if t is None or len(t) == 0:
-        return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0)
+        return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0, cov=0, tpd=0)
     wins, losses = t.loc[t.R > 0, "R"].sum(), -t.loc[t.R <= 0, "R"].sum()
     pf = wins / losses if losses > 0 else float("inf")
     eq = (1 + RISK_PER_TRADE * t.R).cumprod()
     dd = (eq / eq.cummax() - 1).min()
-    return dict(trades=len(t), win=(t.R > 0).mean() * 100, pf=pf,
-                exp_R=t.R.mean(), ret=(eq.iloc[-1] - 1) * 100, maxdd=dd * 100)
+    days_with = t["time"].dt.floor("D").nunique() if n_windows else 0
+    return dict(trades=len(t), win=(t.R > 0).mean() * 100, pf=pf, exp_R=t.R.mean(),
+                ret=(eq.iloc[-1] - 1) * 100, maxdd=dd * 100,
+                cov=(days_with / n_windows) if n_windows else 0,
+                tpd=(len(t) / n_windows) if n_windows else 0)
 
 
 def fmt(name, tag, s):
-    return (f"{name:22s} {tag:4s} trades={s['trades']:3d} win={s['win']:4.0f}% "
-            f"PF={s['pf']:.2f} expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}%")
+    return (f"{name:18s} {tag:4s} n={s['trades']:4d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
+            f"expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}% "
+            f"trades/day={s['tpd']:.2f} days_traded={s['cov']*100:.0f}%")
 
 
 # ---------------- MAIN ----------------
 def main():
-    df, src = load_data()
-    split_time = df.index[int(len(df) * OOS_SPLIT)]
-    print(f"Range {df.index[0]} -> {df.index[-1]} | OOS starts {split_time}\n")
+    raw, src = load_data()
+    df, w = prepare(raw)
+    split_time = w.index[int(len(w) * OOS_SPLIT)]
+    print(f"Range {w.index[0]} -> {w.index[-1]} | {len(w)} daily windows | OOS from {split_time}")
+    print(f"SL {SL_MULT}x / TP {TP_MULT}x daily range | fee {FEE*100:.3f}% slip {SLIP*100:.3f}% per side\n")
 
     lines, passed = [], []
     for name, fn in SETUPS.items():
-        long, short, sl_m, tp_m = fn(df)
-        t = run(df, long, short, sl_m, tp_m)
-        s_all = stats(t)
-        s_is = stats(t[t.time < split_time]) if len(t) else stats(None)
-        s_oos = stats(t[t.time >= split_time]) if len(t) else stats(None)
+        t, nw = run(df, w, fn)
+        s_all = stats(t, nw)
+        if len(t):
+            t_is, t_oos = t[t.time < split_time], t[t.time >= split_time]
+            nw_is = int((w.index[w["datr"].notna()] < split_time).sum())
+            nw_oos = nw - nw_is
+        else:
+            t_is = t_oos = t
+            nw_is = nw_oos = 0
+        s_is, s_oos = stats(t_is, nw_is), stats(t_oos, nw_oos)
         for tag, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
             print(fmt(name, tag, s))
         print()
-        ok = s_all["trades"] >= 25 and s_all["pf"] >= 1.2 and s_oos["pf"] >= 1.0
+        ok = (s_all["trades"] >= MIN_TRADES and s_all["win"] >= MIN_WIN and s_all["pf"] >= MIN_PF
+              and s_oos["pf"] >= MIN_OOS_PF and s_all["cov"] >= MIN_COVERAGE)
         if ok:
             passed.append(name)
-        lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} "
-                     f"PF={s_all['pf']:.2f} OOS_PF={s_oos['pf']:.2f} ret={s_all['ret']:+.1f}%")
+        lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} win={s_all['win']:.0f}% "
+                     f"PF={s_all['pf']:.2f} OOS_PF={s_oos['pf']:.2f} "
+                     f"days={s_all['cov']*100:.0f}% ret={s_all['ret']:+.1f}%")
 
-    summary = f"BTC 1H backtest {DAYS}d ({src})\n" + "\n".join(lines) + \
-              f"\nPassed {len(passed)}/{len(SETUPS)}"
+    summary = (f"BTC daily-window backtest {DAYS}d {TF_MIN}m ({src})\n" + "\n".join(lines)
+               + f"\nPassed {len(passed)}/{len(SETUPS)}")
     print(summary)
-
     notify("Backtest result", summary)
 
 
 if __name__ == "__main__":
-    main()
-      
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as ex:          # any crash also goes to ntfy
+        notify("Backtest ERROR", f"{type(ex).__name__}: {ex}"[:500])
+        raise
+    
