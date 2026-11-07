@@ -1,16 +1,9 @@
-#!/usr/bin/env python3
 """
-backtest.py - compare scalping strategies on BTCUSD (Delta Exchange candles).
+BTCUSD 1H backtest - 3 low-frequency trend setups.
+Replaces the old 5m scalp strategies (they all lost to fees).
 
-- Signals are read at candle CLOSE, entry is at the NEXT candle OPEN.
-- SL = sl_mult x ATR(14), TP = RR x SL. If SL and TP are both hit in one
-  candle, SL is assumed first (conservative).
-- Fees + slippage are charged on both sides.
-- Every strategy is swept over several SL/RR settings, then split into
-  in-sample (first 70%) and out-of-sample (last 30%) to spot curve fitting.
-
-Add your own strategy: write a function f(df) -> array of 1 / -1 / 0
-and register it in STRATEGIES.
+Data: Delta Exchange public candles (no key), fallback Bybit.
+Optional: set env NTFY_TOPIC to get the summary on your phone.
 """
 import os
 import sys
@@ -20,327 +13,238 @@ import numpy as np
 import pandas as pd
 import requests
 
-BASE = os.getenv("DELTA_BASE", "https://api.delta.exchange")
-SYMBOL = os.getenv("SYMBOL", "BTCUSD")
-TF = os.getenv("TIMEFRAME", "5m")
-DAYS = int(os.getenv("DAYS", "30"))
-FEE = float(os.getenv("FEE_PCT", "0.05")) / 100   # per side (taker)
-SLIP = float(os.getenv("SLIP_PCT", "0.01")) / 100  # per side
-MAX_HOLD = int(os.getenv("MAX_HOLD_BARS", "48"))
-MIN_TRADES = int(os.getenv("MIN_TRADES", "30"))
-SL_MULTS = [1.0, 1.5, 2.0]
-RRS = [1.5, 2.0, 3.0]
-TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
+# ---------------- CONFIG ----------------
+SYMBOL = "BTCUSD"
+DAYS = 180            # history length
+FEE = 0.0005          # 0.05% per side
+SLIP = 0.0001         # 0.01% per side
+RISK_PER_TRADE = 0.01 # 1% of equity risked per trade (for equity curve)
+MAX_HOLD_BARS = 48    # force exit after 48 hours
+OOS_SPLIT = 0.70      # first 70% in-sample, last 30% out-of-sample
 
 
-# --------------------------------------------------------------- ntfy
-def _topic():
-    t = (os.getenv("NTFY_TOPIC") or "").strip()
-    for p in ("https://ntfy.sh/", "http://ntfy.sh/", "ntfy.sh/"):
-        t = t.replace(p, "")
-    return t.strip("/")
-
-
-def notify(title, body, tags="chart_with_upwards_trend", priority="default"):
-    topic = _topic()
-    print("NTFY_TOPIC set:", bool(topic))
+# ---------------- NTFY ----------------
+def notify(title, message):
+    topic = (os.getenv("NTFY_TOPIC") or "").strip()
     if not topic:
-        print("Skipping ntfy: add a repo secret named NTFY_TOPIC in THIS repo.")
-        return False
+        print("WARNING: NTFY_TOPIC env var is empty - no ntfy notification sent. "
+              "Pass it in the workflow yml (see env: block).")
+        return
+    topic = topic.replace("https://ntfy.sh/", "")
     try:
-        r = requests.post(
-            f"https://ntfy.sh/{topic}", data=body.encode("utf-8"),
-            headers={"Title": title, "Tags": tags, "Priority": priority}, timeout=15)
-        print("ntfy status:", r.status_code, r.text[:100])
-        return r.status_code == 200
-    except Exception as e:  # never crash the run because of the notification
-        print("ntfy failed:", e)
-        return False
+        r = requests.post(f"https://ntfy.sh/{topic}", data=message.encode("utf-8"),
+                          headers={"Title": title}, timeout=15)
+        print(f"ntfy status: {r.status_code}")
+    except Exception as ex:
+        print("ntfy failed:", ex)
 
 
-# ----------------------------------------------------------------- data
-OKX_BAR = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H"}
-
-
-def _fetch_delta(base, symbol, tf, days):
-    step = TF_SEC[tf]
+# ---------------- DATA ----------------
+def fetch_delta(base):
     end = int(time.time())
-    s = end - days * 86400
-    chunk = 1900 * step  # API allows up to 2000 candles per call
-    rows, shown = [], False
+    start = end - DAYS * 86400
+    step = 1500 * 3600
+    rows, s = [], start
     while s < end:
-        e = min(s + chunk, end)
+        e = min(s + step, end)
         r = requests.get(
             f"{base}/v2/history/candles",
-            params={"resolution": tf, "symbol": symbol, "start": s, "end": e},
+            params={"resolution": "1h", "symbol": SYMBOL, "start": s, "end": e},
             timeout=30,
         )
-        if r.status_code != 200:
-            print(f"Delta {base} HTTP {r.status_code}: {r.text[:200]}")
-            return []
-        res = r.json().get("result") or []
-        if not res and not shown:
-            print(f"Delta {base} empty response: {r.text[:200]}")
-            shown = True
-        rows += res
+        r.raise_for_status()
+        rows += r.json()["result"]
         s = e
-        time.sleep(0.3)
-    return rows
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df[["time", "open", "high", "low", "close", "volume"]]
 
 
-def _fetch_okx(tf, days):
-    inst = os.getenv("OKX_INST", "BTC-USDT-SWAP")
-    cutoff = (time.time() - days * 86400) * 1000
-    rows, after = [], None
-    while True:
-        p = {"instId": inst, "bar": OKX_BAR[tf], "limit": "100"}
-        if after:
-            p["after"] = after
-        r = requests.get("https://www.okx.com/api/v5/market/history-candles", params=p, timeout=30)
-        if r.status_code != 200:
-            print(f"OKX HTTP {r.status_code}: {r.text[:200]}")
+def fetch_bybit():
+    end = int(time.time() * 1000)
+    start = end - DAYS * 86400 * 1000
+    rows, cur_end = [], end
+    while cur_end > start:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "linear", "symbol": "BTCUSDT", "interval": "60",
+                    "end": cur_end, "limit": 1000},
+            timeout=30,
+        )
+        r.raise_for_status()
+        lst = r.json()["result"]["list"]
+        if not lst:
             break
-        data = r.json().get("data") or []
-        if not data:
-            break
-        rows += [dict(time=int(x[0]) // 1000, open=x[1], high=x[2], low=x[3],
-                      close=x[4], volume=x[5]) for x in data]
-        after = data[-1][0]
-        if int(after) < cutoff:
-            break
-        time.sleep(0.15)
-    return rows
+        rows += lst
+        cur_end = int(lst[-1][0]) - 1
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
+    df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
+    return df[["time", "open", "high", "low", "close", "volume"]]
 
 
-def fetch(symbol, tf, days):
-    rows = []
-    for base in dict.fromkeys([BASE, "https://api.india.delta.exchange", "https://api.delta.exchange"]):
+def load_data():
+    for name, fn in [
+        ("Delta global", lambda: fetch_delta("https://api.delta.exchange")),
+        ("Delta India", lambda: fetch_delta("https://api.india.delta.exchange")),
+        ("Bybit", fetch_bybit),
+    ]:
         try:
-            rows = _fetch_delta(base, symbol, tf, days)
-        except Exception as e:
-            print(f"Delta {base} failed: {e}")
-            rows = []
-        if rows:
-            print(f"Using Delta data from {base}")
-            break
-    if not rows:
-        print("Delta returned nothing - falling back to OKX candles")
-        rows = _fetch_okx(tf, days)
-    if not rows:
-        sys.exit("No candles from Delta or OKX.")
-    df = pd.DataFrame(rows).drop_duplicates("time").sort_values("time")
-    df["dt"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = df.set_index("dt")[["open", "high", "low", "close", "volume"]].astype(float)
-    df = df[df.index >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)]
-    print(f"Loaded {len(df)} candles {df.index[0]} -> {df.index[-1]}")
-    return df
+            df = fn()
+            if len(df) > 500:
+                print(f"Data source: {name}, {len(df)} candles")
+                df = df.drop_duplicates("time").sort_values("time").set_index("time")
+                return df.astype(float), name
+        except Exception as ex:
+            print(f"{name} failed: {ex}")
+    notify("Backtest FAILED", "No data source worked (Delta/Bybit). Check the workflow log.")
+    sys.exit("No data source worked")
 
 
-# ----------------------------------------------------------- indicators
-def add_indicators(df):
-    o, h, l, c, v = df.open, df.high, df.low, df.close, df.volume
-    for n in (9, 21, 50, 200):
-        df[f"ema{n}"] = c.ewm(span=n, adjust=False).mean()
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    d = c.diff()
-    up, dn = d.clip(lower=0), -d.clip(upper=0)
-    rs = up.ewm(alpha=1 / 14, adjust=False).mean() / dn.ewm(alpha=1 / 14, adjust=False).mean()
-    df["rsi"] = 100 - 100 / (1 + rs)
-    ma, sd = c.rolling(20).mean(), c.rolling(20).std()
-    df["bb_up"], df["bb_lo"] = ma + 2 * sd, ma - 2 * sd
-    tp = (h + l + c) / 3
-    day = df.index.date
-    df["vwap"] = (tp * v).groupby(day).cumsum() / v.groupby(day).cumsum()  # resets daily (UTC)
-    df["vol_ma"] = v.rolling(20).mean()
-    df["hh20"] = h.rolling(20).max().shift(1)
-    df["ll20"] = l.rolling(20).min().shift(1)
-    return df
+# ---------------- INDICATORS ----------------
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
 
 
-# ----------------------------------------------------------- strategies
-def _sig(long, short):
-    return np.where(long, 1, np.where(short, -1, 0))
+def atr(df, n=14):
+    pc = df["close"].shift()
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-def s_ema_cross(d):
-    up = (d.ema9 > d.ema21) & (d.ema9.shift() <= d.ema21.shift())
-    dn = (d.ema9 < d.ema21) & (d.ema9.shift() >= d.ema21.shift())
-    return _sig(up & (d.close > d.ema200), dn & (d.close < d.ema200))
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
 
 
-def s_vwap_reclaim(d):
-    long = (d.low <= d.vwap) & (d.close > d.vwap) & (d.close > d.open) & (d.close > d.ema200)
-    short = (d.high >= d.vwap) & (d.close < d.vwap) & (d.close < d.open) & (d.close < d.ema200)
-    return _sig(long, short)
+# ---------------- SETUPS ----------------
+# Each returns (long_signal, short_signal, sl_atr_mult, tp_atr_mult)
+# Signal on bar close -> entry at next bar open.
+def setup_a_donchian(df):
+    """Donchian 20 breakout, only in direction of EMA200 trend."""
+    e200 = ema(df["close"], 200)
+    hi = df["high"].rolling(20).max().shift()
+    lo = df["low"].rolling(20).min().shift()
+    long = (df["close"] > hi) & (df["close"] > e200)
+    short = (df["close"] < lo) & (df["close"] < e200)
+    return long, short, 1.5, 3.0
 
 
-def s_bb_rsi_reversion(d):
-    long = (d.low < d.bb_lo) & (d.close > d.bb_lo) & (d.rsi < 35)
-    short = (d.high > d.bb_up) & (d.close < d.bb_up) & (d.rsi > 65)
-    return _sig(long, short)
+def setup_b_pullback(df):
+    """Trend pullback: EMA50>EMA200, price dips to EMA21 zone, RSI turns up from <45."""
+    c = df["close"]
+    e21, e50, e200 = ema(c, 21), ema(c, 50), ema(c, 200)
+    r = rsi(c)
+    long = (e50 > e200) & (df["low"] <= e21) & (c > e21) & (r.shift() < 45) & (r > r.shift())
+    short = (e50 < e200) & (df["high"] >= e21) & (c < e21) & (r.shift() > 55) & (r < r.shift())
+    return long, short, 1.5, 2.5
 
 
-def s_donchian_breakout(d):
-    vol = d.volume > 1.5 * d.vol_ma
-    long = (d.close > d.hh20) & vol & (d.close > d.ema200)
-    short = (d.close < d.ll20) & vol & (d.close < d.ema200)
-    return _sig(long, short)
+def setup_c_squeeze(df):
+    """Bollinger squeeze (width in lowest 20% of last 100 bars) then breakout with trend."""
+    c = df["close"]
+    ma = c.rolling(20).mean()
+    sd = c.rolling(20).std()
+    up, dn = ma + 2 * sd, ma - 2 * sd
+    width = (up - dn) / ma
+    squeezed = width.shift() <= width.rolling(100).quantile(0.2).shift()
+    e100 = ema(c, 100)
+    long = squeezed & (c > up) & (c > e100)
+    short = squeezed & (c < dn) & (c < e100)
+    return long, short, 1.5, 3.0
 
 
-def s_liquidity_sweep(d):
-    short = (d.high > d.hh20) & (d.close < d.hh20) & (d.close < d.open)
-    long = (d.low < d.ll20) & (d.close > d.ll20) & (d.close > d.open)
-    return _sig(long, short)
-
-
-def s_volume_spike(d):
-    body = (d.close - d.open).abs()
-    big = (d.volume > 2.5 * d.vol_ma) & (body > 0.8 * d.atr)
-    long = big & (d.close > d.open) & (d.close > d.ema50)
-    short = big & (d.close < d.open) & (d.close < d.ema50)
-    return _sig(long, short)
-
-
-STRATEGIES = {
-    "ema_cross_trend": s_ema_cross,
-    "vwap_reclaim": s_vwap_reclaim,
-    "bb_rsi_reversion": s_bb_rsi_reversion,
-    "donchian_breakout": s_donchian_breakout,
-    "liquidity_sweep": s_liquidity_sweep,
-    "volume_spike_follow": s_volume_spike,
+SETUPS = {
+    "A_donchian_breakout": setup_a_donchian,
+    "B_trend_pullback": setup_b_pullback,
+    "C_bb_squeeze": setup_c_squeeze,
 }
 
 
-# --------------------------------------------------------------- engine
-def simulate(df, sig, sl_mult, rr):
-    o, h, l, c, a = (df[k].values for k in ("open", "high", "low", "close", "atr"))
+# ---------------- ENGINE ----------------
+def run(df, long, short, sl_m, tp_m):
+    a = atr(df).values
+    o, h, l, c = (df[k].values for k in ["open", "high", "low", "close"])
+    ls, ss = long.fillna(False).values, short.fillna(False).values
     idx = df.index
-    n = len(df)
-    out, i = [], 0
+    n, i, trades = len(df), 0, []
     while i < n - 2:
-        s = sig[i]
-        if s == 0 or np.isnan(a[i]) or a[i] <= 0:
+        d = 1 if ls[i] else (-1 if ss[i] else 0)
+        if d == 0 or np.isnan(a[i]):
             i += 1
             continue
         entry = o[i + 1]
-        risk = sl_mult * a[i]
-        sl = entry - s * risk
-        tp = entry + s * risk * rr
-        last = min(i + 1 + MAX_HOLD, n - 1)
-        exit_px, exit_j = c[last], last
-        for j in range(i + 1, last + 1):
-            hit_sl = l[j] <= sl if s == 1 else h[j] >= sl
-            hit_tp = h[j] >= tp if s == 1 else l[j] <= tp
-            if hit_sl:
-                exit_px, exit_j = sl, j
+        sl = entry - d * sl_m * a[i]
+        tp = entry + d * tp_m * a[i]
+        risk_pct = sl_m * a[i] / entry
+        exit_px, j = None, i + 1
+        while j < n:
+            hit_sl = l[j] <= sl if d == 1 else h[j] >= sl
+            hit_tp = h[j] >= tp if d == 1 else l[j] <= tp
+            if hit_sl:               # SL first if both hit in same candle (conservative)
+                exit_px = sl
                 break
             if hit_tp:
-                exit_px, exit_j = tp, j
+                exit_px = tp
                 break
-        gross = s * (exit_px - entry) / entry
-        net = gross - 2 * (FEE + SLIP)
-        out.append((idx[i + 1], s, net / (risk / entry), exit_j - i))
-        i = exit_j + 1  # one trade at a time
-    return pd.DataFrame(out, columns=["entry_time", "side", "R", "bars"])
+            if j - (i + 1) >= MAX_HOLD_BARS:
+                exit_px = c[j]
+                break
+            j += 1
+        if exit_px is None:
+            break
+        net = d * (exit_px - entry) / entry - 2 * (FEE + SLIP)
+        trades.append({"time": idx[i + 1], "dir": d, "net_pct": net, "R": net / risk_pct})
+        i = j
+    return pd.DataFrame(trades)
 
 
 def stats(t):
-    if t.empty:
-        return dict(trades=0, win=0.0, pf=0.0, exp=0.0, total_r=0.0, max_dd=0.0)
-    w, lo = t.R[t.R > 0].sum(), -t.R[t.R < 0].sum()
-    eq = t.R.cumsum()
-    return dict(
-        trades=len(t),
-        win=round(100 * (t.R > 0).mean(), 1),
-        pf=round(w / lo, 2) if lo > 0 else 99.0,
-        exp=round(t.R.mean(), 3),
-        total_r=round(t.R.sum(), 1),
-        max_dd=round((eq.cummax() - eq).max(), 1),
-    )
+    if t is None or len(t) == 0:
+        return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0)
+    wins, losses = t.loc[t.R > 0, "R"].sum(), -t.loc[t.R <= 0, "R"].sum()
+    pf = wins / losses if losses > 0 else float("inf")
+    eq = (1 + RISK_PER_TRADE * t.R).cumprod()
+    dd = (eq / eq.cummax() - 1).min()
+    return dict(trades=len(t), win=(t.R > 0).mean() * 100, pf=pf,
+                exp_R=t.R.mean(), ret=(eq.iloc[-1] - 1) * 100, maxdd=dd * 100)
 
 
-# ----------------------------------------------------------------- main
+def fmt(name, tag, s):
+    return (f"{name:22s} {tag:4s} trades={s['trades']:3d} win={s['win']:4.0f}% "
+            f"PF={s['pf']:.2f} expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}%")
+
+
+# ---------------- MAIN ----------------
 def main():
-    notify(f"Backtest started {SYMBOL} {TF}",
-           f"Running {DAYS} days of {TF} candles. Results will follow.",
-           tags="hourglass_flowing_sand", priority="low")
-    df = add_indicators(fetch(SYMBOL, TF, DAYS))
-    cut = df.index[int(len(df) * 0.7)]
-    rows, trades_store = [], {}
-    for name, fn in STRATEGIES.items():
-        sig = fn(df)
-        for slm in SL_MULTS:
-            for rr in RRS:
-                t = simulate(df, sig, slm, rr)
-                full, ins, oos = stats(t), stats(t[t.entry_time < cut]), stats(t[t.entry_time >= cut])
-                rows.append({
-                    "strategy": name, "sl_atr": slm, "rr": rr, **full,
-                    "is_pf": ins["pf"], "oos_pf": oos["pf"], "oos_trades": oos["trades"],
-                })
-                trades_store[(name, slm, rr)] = t
-    res = pd.DataFrame(rows)
-    res["verdict"] = np.where(
-        (res.trades >= MIN_TRADES) & (res.pf >= 1.2) & (res.is_pf >= 1.2) & (res.oos_pf >= 1.2),
-        "KEEP", "drop")
+    df, src = load_data()
+    split_time = df.index[int(len(df) * OOS_SPLIT)]
+    print(f"Range {df.index[0]} -> {df.index[-1]} | OOS starts {split_time}\n")
 
-    os.makedirs("results", exist_ok=True)
-    res.to_csv("results/all_results.csv", index=False)
+    lines, passed = [], []
+    for name, fn in SETUPS.items():
+        long, short, sl_m, tp_m = fn(df)
+        t = run(df, long, short, sl_m, tp_m)
+        s_all = stats(t)
+        s_is = stats(t[t.time < split_time]) if len(t) else stats(None)
+        s_oos = stats(t[t.time >= split_time]) if len(t) else stats(None)
+        for tag, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
+            print(fmt(name, tag, s))
+        print()
+        ok = s_all["trades"] >= 25 and s_all["pf"] >= 1.2 and s_oos["pf"] >= 1.0
+        if ok:
+            passed.append(name)
+        lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} "
+                     f"PF={s_all['pf']:.2f} OOS_PF={s_oos['pf']:.2f} ret={s_all['ret']:+.1f}%")
 
-    best = (res.sort_values(["verdict", "total_r"], ascending=[True, False])
-               .groupby("strategy", as_index=False).head(1)
-               .sort_values("total_r", ascending=False))
-    for _, r in best.iterrows():
-        trades_store[(r.strategy, r.sl_atr, r.rr)].to_csv(f"results/trades_{r.strategy}.csv", index=False)
+    summary = f"BTC 1H backtest {DAYS}d ({src})\n" + "\n".join(lines) + \
+              f"\nPassed {len(passed)}/{len(SETUPS)}"
+    print(summary)
 
-    cols = ["strategy", "sl_atr", "rr", "trades", "win", "pf", "exp", "total_r",
-            "max_dd", "is_pf", "oos_pf", "verdict"]
-    md = [f"# Backtest {SYMBOL} {TF} - last {DAYS} days",
-          f"Fee {FEE*100:.3f}% + slip {SLIP*100:.3f}% per side. Results in R (1R = stop distance).",
-          f"Out-of-sample = last 30% of data. KEEP needs PF >= 1.2 overall, in-sample and out-of-sample, "
-          f"with at least {MIN_TRADES} trades.", "",
-          "| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
-    for _, r in best.iterrows():
-        md.append("| " + " | ".join(str(r[c]) for c in cols) + " |")
-    text = "\n".join(md)
-    print(text)
-    with open("results/summary.md", "w") as f:
-        f.write(text)
-    if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write(text)
-
-    n_keep = int((best.verdict == "KEEP").sum())
-    head = (f"{SYMBOL} {TF} | last {DAYS} days | {len(df)} candles\n"
-            f"Fee {FEE*100:.3f}% + slip {SLIP*100:.3f}% per side | results in R\n"
-            f"KEEP = PF>=1.2 overall, in-sample & out-of-sample, >={MIN_TRADES} trades\n"
-            f"Passed: {n_keep} of {len(best)}\n")
-    blocks = []
-    for _, r in best.iterrows():
-        tag = "KEEP" if r.verdict == "KEEP" else "drop"
-        blocks.append(
-            f"[{tag}] {r.strategy}\n"
-            f"  SL {r.sl_atr} x ATR | RR 1:{r.rr}\n"
-            f"  Trades {r.trades} | Win {r.win}%\n"
-            f"  PF {r.pf} | Exp {r.exp}R | Total {r.total_r}R | MaxDD {r.max_dd}R\n"
-            f"  In-sample PF {r.is_pf} | Out-of-sample PF {r.oos_pf} ({r.oos_trades} trades)")
-    # ntfy messages are capped at ~4 KB, so split into several if needed
-    parts, cur = [], head
-    for blk in blocks:
-        if len((cur + "\n" + blk).encode()) > 3500:
-            parts.append(cur)
-            cur = blk
-        else:
-            cur = cur + "\n" + blk
-    parts.append(cur)
-    for k, p in enumerate(parts, 1):
-        suffix = f" ({k}/{len(parts)})" if len(parts) > 1 else ""
-        notify(f"Backtest {SYMBOL} {TF} {DAYS}d{suffix}", p)
+    notify("Backtest result", summary)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BaseException as e:
-        notify("Backtest FAILED", f"{type(e).__name__}: {e}", tags="x", priority="high")
-        raise
+    main()
+      
