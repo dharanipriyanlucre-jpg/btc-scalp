@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 
 # ---------------- CONFIG (change numbers here) ----------------
-SYMBOLS = ["BTCUSD"]   # add "ETHUSD" here to get more trades (BTC rarely moves enough for these signals)
+SYMBOLS = ["BTCUSD", "ETHUSD", "XRPUSD", "XAUTUSD"]   # a symbol Delta does not list is skipped
 DAYS = 365             # 1m history length (730 works too, just slower)
 TF_MIN = 1
 FEE = 0.0002           # 0.02% per side (Delta fee)
@@ -114,9 +114,8 @@ def load_data(symbol):
                 print(f"Data source: {name}, {len(df)} {symbol} candles")
                 return clean(df), name
         except Exception as ex:
-            print(f"{name} failed: {ex}")
-    notify("Backtest FAILED", f"No data source worked for {symbol}. Check the workflow log.")
-    sys.exit("No data source worked")
+            print(f"{symbol} on {name} failed: {ex}")
+    return None, None
 
 
 # ---------------- INDICATORS / SIGNALS (same maths as the Freqtrade file) ----------------
@@ -207,34 +206,60 @@ def fmt(name, tag, s):
 
 # ---------------- MAIN ----------------
 def main():
-    lines, passed = [], []
+    data, skipped = {}, []
     for symbol in SYMBOLS:
-        df, src = load_data(symbol)
-        buy, tag, sell, n1, n2 = build_signals(df)
-        split_time = df.index[int(len(df) * OOS_SPLIT)]
-        print(f"\n{symbol}: {len(df)} candles | signals: BinHV45={n1} Cluc={n2} | "
-              f"OOS from {split_time.date()} | cost per side {SIDE*100:.4f}%")
-        t = simulate(df, buy, tag, sell)
-        t_is, t_oos = t[t.time < split_time], t[t.time >= split_time]
-        s_all, s_is, s_oos = stats(t), stats(t_is), stats(t_oos)
-        for lab, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
-            print(fmt(symbol, lab, s))
-        if len(t):
-            print("Exits:", t["reason"].value_counts().to_dict(), "| entries:", t["tag"].value_counts().to_dict())
-        c = df["close"]
-        bench = (f"buy&hold ret={(c.iloc[-1]/c.iloc[0]-1)*100:+.0f}% "
-                 f"maxdd={(c/c.cummax()-1).min()*100:.0f}%")
-        print(bench)
-        ok = (s_all["trades"] >= MIN_TRADES and s_all["pf"] >= MIN_PF and s_oos["pf"] >= MIN_OOS_PF
-              and s_all["mtm"] >= MAX_MTM_DD)
-        if ok:
-            passed.append(symbol)
-        lines.append(f"{'PASS' if ok else 'FAIL'} {symbol}: signals={n1 + n2} n={s_all['trades']} "
-                     f"win={s_all['win']:.0f}% PF={s_all['pf']:.2f} OOS={s_oos['pf']:.2f} "
-                     f"ret={s_all['ret']:+.1f}% MTMdd={s_all['mtm']:.0f}% worst={s_all['worst']:.0f}% | {bench}")
+        df, _ = load_data(symbol)
+        if df is None:
+            skipped.append(symbol)
+        else:
+            data[symbol] = df
+    if not data:
+        notify("Backtest FAILED", "No symbol could be downloaded. Check the workflow log.")
+        sys.exit("No data")
 
-    summary = (f"Combined_Indicators (BinHV45+Cluc) 1m {DAYS}d, unlevered\n" + "\n".join(lines)
-               + f"\nPassed {len(passed)}/{len(SYMBOLS)}")
+    start = min(d.index[0] for d in data.values())
+    end = max(d.index[-1] for d in data.values())
+    split_time = start + (end - start) * OOS_SPLIT        # one common out-of-sample date for all symbols
+    print(f"\nSymbols: {list(data)} | skipped: {skipped} | OOS from {split_time.date()} | "
+          f"cost per side {SIDE*100:.4f}%")
+
+    lines, all_t, worst_mtm = [], [], 0.0
+    for symbol, df in data.items():
+        buy, tag, sell, n1, n2 = build_signals(df)
+        t = simulate(df, buy, tag, sell)
+        t["symbol"] = symbol
+        all_t.append(t)
+        s_all = stats(t)
+        s_oos = stats(t[t.time >= split_time])
+        worst_mtm = min(worst_mtm, s_all["mtm"])
+        c = df["close"]
+        bh = (c.iloc[-1] / c.iloc[0] - 1) * 100
+        print(f"\n{symbol}: {len(df)} candles | signals BinHV45={n1} Cluc={n2}")
+        print(fmt(symbol, "ALL", s_all))
+        print(fmt(symbol, "OOS", s_oos))
+        print(f"buy&hold ret={bh:+.0f}%")
+        lines.append(f"{symbol}: signals={n1 + n2} n={s_all['trades']} win={s_all['win']:.0f}% "
+                     f"PF={s_all['pf']:.2f} ret={s_all['ret']:+.1f}% MTMdd={s_all['mtm']:.0f}% "
+                     f"(buy&hold {bh:+.0f}%)")
+
+    T = pd.concat(all_t).sort_values("time")
+    p_all = stats(T)
+    p_is, p_oos = stats(T[T.time < split_time]), stats(T[T.time >= split_time])
+    print("\nPOOLED (all symbols together)")
+    for lab, st in [("ALL", p_all), ("IS", p_is), ("OOS", p_oos)]:
+        print(fmt("POOLED", lab, st))
+    if len(T):
+        print("Exits:", T["reason"].value_counts().to_dict())
+
+    ok = (p_all["trades"] >= MIN_TRADES and p_all["pf"] >= MIN_PF and p_oos["pf"] >= MIN_OOS_PF
+          and worst_mtm >= MAX_MTM_DD)
+    verdict = "PASS" if ok else "FAIL"
+    summary = (f"Combined_Indicators 1m {DAYS}d, unlevered, {len(data)} symbols"
+               + (f" (skipped {', '.join(skipped)})" if skipped else "") + "\n"
+               + "\n".join(lines)
+               + f"\n{verdict} POOLED: n={p_all['trades']} win={p_all['win']:.0f}% PF={p_all['pf']:.2f} "
+                 f"IS={p_is['pf']:.2f} OOS={p_oos['pf']:.2f} (OOS n={p_oos['trades']}) "
+                 f"worst MTMdd={worst_mtm:.0f}% worst trade={p_all['worst']:.0f}%")
     print("\n" + summary)
     notify("Backtest result", summary)
 
