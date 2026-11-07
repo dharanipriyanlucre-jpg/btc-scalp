@@ -42,7 +42,6 @@ jobs:
           SYMBOL: ${{ inputs.symbol || 'BTCUSD' }}
           FEE_PCT: ${{ inputs.fee_pct || '0.05' }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          COINALYZE_KEY: ${{ secrets.COINALYZE_KEY }}
         run: python backtest.py
 
       - name: Upload results
