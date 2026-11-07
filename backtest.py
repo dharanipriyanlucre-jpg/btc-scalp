@@ -96,6 +96,20 @@ def fetch_bybit():
     return df[["time", "open", "high", "low", "close", "volume"]]
 
 
+def clean(df):
+    """Drop bad candles (zeros, NaN, broken highs/lows, crazy spikes)."""
+    n0 = len(df)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
+    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    df = df[df["high"] >= df["low"]].copy()
+    df["high"] = df[["high", "open", "close"]].max(axis=1)
+    df["low"] = df[["low", "open", "close"]].min(axis=1)
+    jump = (df["close"] / df["close"].shift() - 1).abs()
+    df = df[~(jump > 0.2)]
+    print(f"Cleaned {n0 - len(df)} bad candles out of {n0}")
+    return df
+
+
 def load_data():
     for name, fn in [
         ("Delta global", lambda: fetch_delta("https://api.delta.exchange")),
@@ -107,7 +121,7 @@ def load_data():
             if len(df) > 2000:
                 print(f"Data source: {name}, {len(df)} candles")
                 df = df.drop_duplicates("time").sort_values("time").set_index("time")
-                return df.astype(float), name
+                return clean(df.astype(float)), name
         except Exception as ex:
             print(f"{name} failed: {ex}")
     notify("Backtest FAILED", "No data source worked (Delta/Bybit). Check the workflow log.")
@@ -187,6 +201,9 @@ def run(df, w, entry_fn):
                 k += 1
                 continue
             entry = o[k]
+            if not np.isfinite(entry) or entry <= 0 or not wi["datr"] > 0:
+                k += 1
+                continue
             sl = entry - d * SL_MULT * wi["datr"]
             tp = entry + d * TP_MULT * wi["datr"]
             risk_pct = SL_MULT * wi["datr"] / entry
@@ -201,6 +218,9 @@ def run(df, w, entry_fn):
                     exit_px, j = tp, jj
                     break
             net = d * (exit_px - entry) / entry - cost
+            if not np.isfinite(net / risk_pct):
+                k = j + 1
+                continue
             trades.append({"time": idx[k], "dir": d, "net_pct": net, "R": net / risk_pct})
             n_tr += 1
             k = j + 1
@@ -208,6 +228,8 @@ def run(df, w, entry_fn):
 
 
 def stats(t, n_windows=None):
+    if t is not None and len(t):
+        t = t[np.isfinite(t["R"])]
     if t is None or len(t) == 0:
         return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0, cov=0, tpd=0)
     wins, losses = t.loc[t.R > 0, "R"].sum(), -t.loc[t.R <= 0, "R"].sum()
