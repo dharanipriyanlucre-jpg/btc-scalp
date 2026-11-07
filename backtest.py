@@ -1,20 +1,17 @@
 """
-BTCUSD backtest - NostalgiaForInfinity-style DIP BUYING, long only, on one pair.
+BTCUSD 1m backtest - port of the Freqtrade strategy "Combined_Indicators"
+(BinHV45 + ClucMay72018 dip buying, long only).
 
-Idea (same as NFI): in an uptrend, buy when price is oversold after a dip, sell the small bounce.
-  Trend filter : 1h EMA50 > 1h EMA200 and price above 1h EMA200 (last completed 1h candle only)
-  Dip trigger  : RSI14 < 30 and close below the lower Bollinger Band (20, 2) on 30m candles
-  Safe dip     : skip if price already fell more than 6% in the last 6 hours (crash guard)
+Same rules as the Freqtrade file:
+  Buy  : BinHV45 condition OR Cluc condition on the signal candle's close, entry at the NEXT open
+  Exit : stoploss -6.58%, trailing stop (1.98% trail once profit reached 3.082%), ROI 1.5%,
+         or the sell signal (close > Bollinger middle band of typical price) executed at next open
+  Order inside one candle (conservative): stoploss -> trailing -> ROI -> sell signal.
 
-Three ways to manage the trade, to show what NFI's style really does:
-  V1_strict_stop : 1.5% target, hard 3% stop, 24h time exit           (normal risk control)
-  V2_no_stop     : 1.5% target or RSI>70, NO stop (-20% doom exit), hold up to 14 days  (bag holding)
-  V3_rebuy       : like V2 but buys more at -3% and -6%, target 1.5% above average entry,
-                   doom exit at -12% from the first entry                                 (averaging down)
-
-Returns are UNLEVERAGED. V3 reserves capital for 3 units. "MTM dd" is the worst drawdown including
-open losses (what you would actually feel), not just closed trades.
+Single position at a time, unleveraged. Your Delta fee + GST + slippage is charged on both sides.
 Result goes to ntfy via env NTFY_TOPIC.
+
+NOTE: 1m history is big (about 350 requests per year of data), so the download takes a few minutes.
 """
 import os
 import sys
@@ -25,32 +22,25 @@ import pandas as pd
 import requests
 
 # ---------------- CONFIG (change numbers here) ----------------
-SYMBOL = "BTCUSD"
-DAYS = 730             # history length
-TF_MIN = 30            # candle size in minutes
+SYMBOLS = ["BTCUSD"]   # add "ETHUSD" here to get more trades (BTC rarely moves enough for these signals)
+DAYS = 365             # 1m history length (730 works too, just slower)
+TF_MIN = 1
 FEE = 0.0002           # 0.02% per side (Delta fee)
 GST = 0.18             # 18% GST on the fee -> effective 0.0236% per side
 SLIP = 0.0001          # 0.01% slippage per side (set 0 if you only use limit orders)
 OOS_SPLIT = 0.70       # first 70% in-sample, last 30% out-of-sample
-MAX_TRADES_PER_DAY = 2
-WINDOW_START_UTC_MIN = 30   # 06:00 IST = 00:30 UTC
 
-# entry (fixed)
-RSI_LEN, RSI_BUY = 14, 30
-BB_LEN, BB_STD = 20, 2.0
-CRASH_BARS, CRASH_DROP = 12, 0.06     # skip if price fell > 6% over the last 12 candles (6h)
-
-VARIANTS = {
-    "V1_strict_stop": dict(tp=0.015, stop=0.03, rsi_exit=None, rebuy=[], max_hold=48, cap=1),
-    "V2_no_stop":     dict(tp=0.015, stop=0.20, rsi_exit=70, rebuy=[], max_hold=672, cap=1),
-    "V3_rebuy":       dict(tp=0.015, stop=0.12, rsi_exit=70, rebuy=[0.03, 0.06], max_hold=672, cap=3),
-}
+# Freqtrade settings (copied from the strategy file)
+ROI = 0.015
+STOPLOSS = 0.0658
+TRAIL_POS = 0.0198
+TRAIL_OFFSET = 0.03082
 
 # pass rules
 MIN_TRADES = 40
 MIN_PF = 1.3
 MIN_OOS_PF = 1.1
-MAX_MTM_DD = -25.0     # worst drawdown including open losses must be better than -25%
+MAX_MTM_DD = -25.0
 
 SIDE = FEE * (1 + GST) + SLIP   # cost per side as a fraction of price
 
@@ -71,21 +61,29 @@ def notify(title, message):
 
 
 # ---------------- DATA ----------------
-def fetch_delta(base):
+def fetch_delta(base, symbol):
     end = int(time.time())
     start = end - DAYS * 86400
     step = 1500 * TF_MIN * 60
-    rows, s = [], start
+    rows, s, calls = [], start, 0
     while s < end:
         e = min(s + step, end)
-        r = requests.get(
-            f"{base}/v2/history/candles",
-            params={"resolution": f"{TF_MIN}m", "symbol": SYMBOL, "start": s, "end": e},
-            timeout=30,
-        )
-        r.raise_for_status()
+        for attempt in range(5):
+            r = requests.get(
+                f"{base}/v2/history/candles",
+                params={"resolution": f"{TF_MIN}m", "symbol": symbol, "start": s, "end": e},
+                timeout=30,
+            )
+            if r.status_code == 429:
+                time.sleep(2 + attempt * 2)
+                continue
+            r.raise_for_status()
+            break
         rows += r.json()["result"]
         s = e
+        calls += 1
+        if calls % 50 == 0:
+            print(f"  {symbol}: {calls} requests, {len(rows)} candles so far")
     df = pd.DataFrame(rows)
     df["time"] = pd.to_datetime(df["time"], unit="s")
     df = df[["time", "open", "high", "low", "close", "volume"]]
@@ -100,104 +98,95 @@ def clean(df):
     df = df[df["high"] >= df["low"]].copy()
     df["high"] = df[["high", "open", "close"]].max(axis=1)
     df["low"] = df[["low", "open", "close"]].min(axis=1)
+    df["volume"] = df["volume"].fillna(0).clip(lower=0)
     jump = (df["close"] / df["close"].shift() - 1).abs()
     df = df[~(jump > 0.2)]
     print(f"Cleaned {n0 - len(df)} bad candles out of {n0}")
     return df
 
 
-def load_data():
+def load_data(symbol):
     for name, base in [("Delta global", "https://api.delta.exchange"),
                        ("Delta India", "https://api.india.delta.exchange")]:
         try:
-            df = fetch_delta(base)
-            if len(df) > 2000:
-                print(f"Data source: {name}, {len(df)} candles")
+            df = fetch_delta(base, symbol)
+            if len(df) > 5000:
+                print(f"Data source: {name}, {len(df)} {symbol} candles")
                 return clean(df), name
         except Exception as ex:
             print(f"{name} failed: {ex}")
-    notify("Backtest FAILED", "No data source worked (Delta). Check the workflow log.")
+    notify("Backtest FAILED", f"No data source worked for {symbol}. Check the workflow log.")
     sys.exit("No data source worked")
 
 
-# ---------------- INDICATORS / SIGNAL ----------------
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+# ---------------- INDICATORS / SIGNALS (same maths as the Freqtrade file) ----------------
+def build_signals(df):
+    c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
 
+    # BinHV45
+    mean40 = c.rolling(40).mean()
+    lower40 = (mean40 - 2 * c.rolling(40).std()).fillna(0)
+    mid40 = mean40.fillna(0)
+    bbdelta = (mid40 - lower40).abs()
+    closedelta = (c - c.shift()).abs()
+    tail = (c - l).abs()
+    s1 = ((lower40.shift() > 0) & (bbdelta > c * 0.00703) & (closedelta > c * 0.01476)
+          & (tail < bbdelta * 0.03632) & (c < lower40.shift()) & (c <= c.shift()))
 
-def rsi(s, n=14):
-    d = s.diff()
-    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+    # ClucMay72018
+    typ = (h + l + c) / 3
+    bb_mid = typ.rolling(20).mean()
+    bb_lower = bb_mid - 2 * typ.rolling(20).std()
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    vmean = v.rolling(30).mean()
+    s2 = (c < ema50) & (c < 0.98863 * bb_lower) & (v < vmean.shift(1) * 34)
 
-
-def build_signal(df):
-    c = df["close"]
-    r = rsi(c, RSI_LEN)
-    ma, sd = c.rolling(BB_LEN).mean(), c.rolling(BB_LEN).std()
-    lower = ma - BB_STD * sd
-    # 1h trend filter using the last COMPLETED 1h candle only (no look-ahead)
-    h1 = c.resample("1h").last().dropna()
-    e50, e200 = ema(h1, 50), ema(h1, 200)
-    trend = ((e50 > e200) & (h1 > e200)).astype(float).shift(1)
-    trend30 = trend.reindex(df.index, method="ffill") == 1
-    safe = (c / c.shift(CRASH_BARS) - 1) > -CRASH_DROP
-    sig = trend30 & (r < RSI_BUY) & (c < lower) & safe
-    return sig.fillna(False), r
+    buy = (s1 | s2).fillna(False)
+    tag = np.where(s1.fillna(False), "BinHV45", "Cluc")
+    sell = (c > bb_mid).fillna(False)
+    return buy.values, tag, sell.values, int(s1.sum()), int(s2.sum())
 
 
 # ---------------- ENGINE ----------------
-def simulate(df, sig, r, v):
+def simulate(df, buy, tag, sell):
     o, h, l, c = (df[k].values for k in ["open", "high", "low", "close"])
-    rv, sv = r.values, sig.values
     idx, n = df.index, len(df)
-    day_key = (idx - pd.Timedelta(minutes=WINDOW_START_UTC_MIN)).floor("D")
-    trades, per_day, i = [], {}, 0
+    trades, i = [], 0
     while i < n - 2:
-        if not sv[i]:
+        if not buy[i]:
             i += 1
             continue
         k = i + 1
-        day = day_key[k]
-        if per_day.get(day, 0) >= MAX_TRADES_PER_DAY:
-            i += 1
-            continue
-        first = o[k]
-        fills, nxt = [first], 0
-        last = min(k + v["max_hold"], n - 1)
-        exit_px, reason, j = None, "time", k
-        stop_px = first * (1 - v["stop"])
-        while j <= last:
-            if l[j] <= stop_px:                                   # 1) stop / doom exit first (conservative)
-                exit_px, reason = stop_px, "stop"
+        entry = o[k]
+        stop, roi, trig = entry * (1 - STOPLOSS), entry * (1 + ROI), entry * (1 + TRAIL_OFFSET)
+        maxh, minl = entry, entry
+        exit_px, reason, j = None, "end", k
+        while j < n:
+            minl, maxh = min(minl, l[j]), max(maxh, h[j])
+            if l[j] <= stop:
+                exit_px, reason = stop, "stop"
                 break
-            while nxt < len(v["rebuy"]) and l[j] <= first * (1 - v["rebuy"][nxt]):
-                fills.append(first * (1 - v["rebuy"][nxt]))       # 2) rebuy fills
-                nxt += 1
-            avg = float(np.mean(fills))
-            tp_px = avg * (1 + v["tp"])
-            if h[j] >= tp_px:                                     # 3) take profit
-                exit_px, reason = tp_px, "tp"
+            if maxh >= trig and l[j] <= maxh * (1 - TRAIL_POS):
+                exit_px, reason = maxh * (1 - TRAIL_POS), "trail"
                 break
-            if v["rsi_exit"] and rv[j] > v["rsi_exit"] and c[j] > avg * (1 + 2 * SIDE):
-                exit_px, reason = c[j], "rsi"                     # 4) overbought exit at close
+            if h[j] >= roi:
+                exit_px, reason = roi, "roi"
+                break
+            if sell[j] and j + 1 < n:
+                exit_px, reason, j = o[j + 1], "signal", j + 1   # sell signal fills at next open
                 break
             j += 1
         if exit_px is None:
-            j, exit_px = last, c[last]
-        units = len(fills)
-        pnl = sum((exit_px - f) / f for f in fills) - 2 * SIDE * units
-        mae = sum((l[k:j + 1].min() - f) / f for f in fills) / v["cap"]   # worst open loss on capital
-        trades.append((idx[k], pnl / v["cap"], mae, j - k + 1, reason, units))
-        per_day[day] = per_day.get(day, 0) + 1
+            j, exit_px = n - 1, c[n - 1]
+        net = (exit_px - entry) / entry - 2 * SIDE
+        trades.append((idx[k], net, (minl - entry) / entry, j - k + 1, reason, tag[i]))
         i = j
-    return pd.DataFrame(trades, columns=["time", "ret", "mae", "bars", "reason", "units"])
+    return pd.DataFrame(trades, columns=["time", "ret", "mae", "bars", "reason", "tag"])
 
 
 def stats(t):
     if t is None or len(t) == 0:
-        return dict(trades=0, win=0, pf=0, avg=0, ret=0, dd=0, mtm=0, worst=0, hold=0, stops=0)
+        return dict(trades=0, win=0, pf=0, avg=0, ret=0, dd=0, mtm=0, worst=0, hold=0)
     wins, losses = t.loc[t.ret > 0, "ret"].sum(), -t.loc[t.ret <= 0, "ret"].sum()
     pf = wins / losses if losses > 0 else float("inf")
     eq = (1 + t.ret).cumprod()
@@ -207,49 +196,46 @@ def stats(t):
     mtm = ((before * (1 + t.mae)) / np.maximum(before, peak.shift(1).fillna(1.0)) - 1).min()
     return dict(trades=len(t), win=(t.ret > 0).mean() * 100, pf=pf, avg=t.ret.mean() * 100,
                 ret=(eq.iloc[-1] - 1) * 100, dd=dd * 100, mtm=min(mtm, dd) * 100,
-                worst=t.ret.min() * 100, hold=t.bars.mean() * TF_MIN / 60,
-                stops=(t.reason == "stop").mean() * 100)
+                worst=t.ret.min() * 100, hold=t.bars.mean() * TF_MIN)
 
 
 def fmt(name, tag, s):
-    return (f"{name:15s} {tag:4s} n={s['trades']:3d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
+    return (f"{name:12s} {tag:4s} n={s['trades']:4d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
             f"avg={s['avg']:+.2f}% ret={s['ret']:+.1f}% dd={s['dd']:.1f}% MTMdd={s['mtm']:.1f}% "
-            f"worst={s['worst']:.1f}% hold={s['hold']:.0f}h stops={s['stops']:.0f}%")
+            f"worst={s['worst']:.1f}% hold={s['hold']:.0f}min")
 
 
 # ---------------- MAIN ----------------
 def main():
-    df, src = load_data()
-    sig, r = build_signal(df)
-    split_time = df.index[int(len(df) * OOS_SPLIT)]
-    print(f"{len(df)} candles | {int(sig.sum())} dip signals | OOS from {split_time.date()} | "
-          f"cost per side {SIDE*100:.4f}%\n")
-
-    c = df["close"]
-    bh_ret = (c.iloc[-1] / c.iloc[0] - 1) * 100
-    bh_dd = (c / c.cummax() - 1).min() * 100
-    bench = f"Benchmark buy & hold BTC: ret={bh_ret:+.0f}% maxdd={bh_dd:.0f}%"
-    print(bench + "\n")
-
     lines, passed = [], []
-    for name, v in VARIANTS.items():
-        t = simulate(df, sig, r, v)
+    for symbol in SYMBOLS:
+        df, src = load_data(symbol)
+        buy, tag, sell, n1, n2 = build_signals(df)
+        split_time = df.index[int(len(df) * OOS_SPLIT)]
+        print(f"\n{symbol}: {len(df)} candles | signals: BinHV45={n1} Cluc={n2} | "
+              f"OOS from {split_time.date()} | cost per side {SIDE*100:.4f}%")
+        t = simulate(df, buy, tag, sell)
         t_is, t_oos = t[t.time < split_time], t[t.time >= split_time]
         s_all, s_is, s_oos = stats(t), stats(t_is), stats(t_oos)
-        for tag, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
-            print(fmt(name, tag, s))
-        print()
+        for lab, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
+            print(fmt(symbol, lab, s))
+        if len(t):
+            print("Exits:", t["reason"].value_counts().to_dict(), "| entries:", t["tag"].value_counts().to_dict())
+        c = df["close"]
+        bench = (f"buy&hold ret={(c.iloc[-1]/c.iloc[0]-1)*100:+.0f}% "
+                 f"maxdd={(c/c.cummax()-1).min()*100:.0f}%")
+        print(bench)
         ok = (s_all["trades"] >= MIN_TRADES and s_all["pf"] >= MIN_PF and s_oos["pf"] >= MIN_OOS_PF
               and s_all["mtm"] >= MAX_MTM_DD)
         if ok:
-            passed.append(name)
-        lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} win={s_all['win']:.0f}% "
-                     f"PF={s_all['pf']:.2f} OOS={s_oos['pf']:.2f} ret={s_all['ret']:+.1f}% "
-                     f"MTMdd={s_all['mtm']:.0f}% worst={s_all['worst']:.0f}%")
+            passed.append(symbol)
+        lines.append(f"{'PASS' if ok else 'FAIL'} {symbol}: signals={n1 + n2} n={s_all['trades']} "
+                     f"win={s_all['win']:.0f}% PF={s_all['pf']:.2f} OOS={s_oos['pf']:.2f} "
+                     f"ret={s_all['ret']:+.1f}% MTMdd={s_all['mtm']:.0f}% worst={s_all['worst']:.0f}% | {bench}")
 
-    summary = (f"BTC NFI-style dip buy {DAYS}d {TF_MIN}m ({src}), unlevered\n" + "\n".join(lines)
-               + f"\n{bench}\nPassed {len(passed)}/{len(VARIANTS)}")
-    print(summary)
+    summary = (f"Combined_Indicators (BinHV45+Cluc) 1m {DAYS}d, unlevered\n" + "\n".join(lines)
+               + f"\nPassed {len(passed)}/{len(SYMBOLS)}")
+    print("\n" + summary)
     notify("Backtest result", summary)
 
 
@@ -261,3 +247,4 @@ if __name__ == "__main__":
     except Exception as ex:          # any crash also goes to ntfy
         notify("Backtest ERROR", f"{type(ex).__name__}: {ex}"[:500])
         raise
+  
