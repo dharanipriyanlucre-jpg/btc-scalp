@@ -1,17 +1,16 @@
 """
-BTCUSD daily-window backtest - TUNING Setup C (trend pullback).
-Window = 06:00 IST -> next day 06:00 IST (00:30 UTC -> 00:30 UTC).
-1 to 2 trades per day, every trade closed by the window end.
+BTCUSD backtest - 3 NEW setups built on different concepts (no trend/EMA logic):
+  S1  Liquidity sweep reversal : wick takes the previous day's high/low, closes back inside -> fade it
+  S2  London opening-range breakout : breakout of the 12:30-13:30 IST range
+  S3  VWAP mean reversion : stretched from the daily-anchored VWAP + rejection candle -> back to VWAP
 
-How the tuning stays honest:
-  * every combo is ranked using only the first 70% of the data (in-sample)
-  * the best ones are then shown on the last 30% (out-of-sample)
-  * a setup only PASSES if the in-sample winner also works out-of-sample
+Window = 06:00 IST -> next day 06:00 IST (00:30 UTC -> 00:30 UTC). Max 2 trades a day.
+Setups only trade when their condition appears, so some days have no trade.
+Parameters are FIXED (no grid search), so only 3 tests are run - less room for luck.
 
 Data: Delta Exchange public candles (no key), fallback Bybit.
 Result goes to ntfy via env NTFY_TOPIC.
 """
-import itertools
 import os
 import sys
 import time
@@ -32,17 +31,20 @@ MAX_TRADES_PER_DAY = 2
 OOS_SPLIT = 0.70       # first 70% in-sample, last 30% out-of-sample
 WINDOW_START_UTC_MIN = 30   # 06:00 IST = 00:30 UTC
 
-# parameter grid (stop/target are x average daily range)
-SL_GRID = [0.3, 0.4, 0.5, 0.7, 1.0]
-TP_GRID = [0.2, 0.3, 0.4, 0.6, 0.8]
-SPAN_GRID = [24, 48, 96]       # pullback EMA length in candles (24 = 12h, 48 = 1 day, 96 = 2 days)
-FORCE_GRID = [12, 24, 36]      # candle index to force an entry if no trade yet (12 = 12:00 IST)
+# setup parameters (x = multiple of the average daily range, "datr")
+RR = 1.5               # reward : risk for S1 and S2
+SWEEP_BUFFER = 0.05    # S1: stop sits this far beyond the sweep wick
+RISK_MIN, RISK_MAX = 0.10, 0.60   # S1/S2: skip trades whose stop is outside this range
+ORB_START, ORB_END = 420, 480     # S2: 07:00-08:00 UTC = 12:30-13:30 IST (London open), minutes of day
+ORB_WIDTH_MIN, ORB_WIDTH_MAX = 0.08, 0.60
+VW_DEV = 0.35          # S3: price must be this far from VWAP
+VW_SL = 0.25           # S3: stop distance
+VW_MIN_BAR = 6         # S3: wait 3 hours after window start so VWAP is stable
 
-# pass rules for the in-sample winner
-MIN_IS_TRADES = 300
-MIN_IS_PF = 1.15
+# pass rules
+MIN_TRADES = 120
+MIN_PF = 1.2
 MIN_OOS_PF = 1.05
-MIN_COVERAGE = 0.90    # share of days with at least 1 trade
 
 BARS_PER_DAY = 24 * 60 // TF_MIN
 COST = 2 * (FEE * (1 + GST) + SLIP)   # round-trip cost as a fraction of price
@@ -114,6 +116,7 @@ def clean(df):
     df = df[df["high"] >= df["low"]].copy()
     df["high"] = df[["high", "open", "close"]].max(axis=1)
     df["low"] = df[["low", "open", "close"]].min(axis=1)
+    df["volume"] = df["volume"].fillna(0).clip(lower=0)
     jump = (df["close"] / df["close"].shift() - 1).abs()
     df = df[~(jump > 0.2)]
     print(f"Cleaned {n0 - len(df)} bad candles out of {n0}")
@@ -142,8 +145,6 @@ def load_data():
 def prepare(df):
     df = df.copy()
     df["win"] = (df.index - pd.Timedelta(minutes=WINDOW_START_UTC_MIN)).floor("D")
-    for sp in SPAN_GRID:
-        df[f"ema{sp}"] = df["close"].ewm(span=sp, adjust=False).mean()
     g = df.groupby("win")
     w = pd.DataFrame({
         "open": g["open"].first(), "high": g["high"].max(),
@@ -151,54 +152,113 @@ def prepare(df):
     })
     w = w[w["n"] >= int(BARS_PER_DAY * 0.9)]          # full windows only
     w["datr"] = (w["high"] - w["low"]).rolling(14).mean().shift(1)   # avg daily range known at start
-    ema10 = w["close"].ewm(span=10, adjust=False).mean()
-    w["trend"] = np.where(w["close"].shift(1) > ema10.shift(1), 1, -1)  # trend known at start
+    w["pdh"] = w["high"].shift(1)                                    # previous window high
+    w["pdl"] = w["low"].shift(1)                                     # previous window low
 
-    # pre-extract numpy arrays per window (fast grid search)
     wins = []
     for win, wi in w.iterrows():
-        if np.isnan(wi["datr"]):
+        if np.isnan(wi["datr"]) or np.isnan(wi["pdh"]):
             continue
         seg = df[df["win"] == win]
+        h, l, c, v = (seg[x].values for x in ["high", "low", "close", "volume"])
+        if v.sum() <= 0:
+            v = np.ones_like(v)
+        typ = (h + l + c) / 3
+        vwap = np.cumsum(typ * v) / np.cumsum(v)           # VWAP anchored at window start
         wins.append(dict(
-            win=win, idx=seg.index, datr=wi["datr"], trend=int(wi["trend"]),
-            o=seg["open"].values, h=seg["high"].values, l=seg["low"].values,
-            c=seg["close"].values, e={sp: seg[f"ema{sp}"].values for sp in SPAN_GRID},
+            win=win, idx=seg.index, datr=wi["datr"], pdh=wi["pdh"], pdl=wi["pdl"],
+            o=seg["open"].values, h=h, l=l, c=c, vwap=vwap,
+            mod=(seg.index.hour * 60 + seg.index.minute).values,
         ))
     return wins, w
 
 
-# ---------------- ENGINE (setup C: trend pullback) ----------------
-def entry_dir(k, h, l, e, trend, force_bar, n_tr):
-    """Long/short on a dip to the EMA in trend direction; forced entry if nothing by force_bar."""
-    if k >= 1:
-        if trend == 1 and l[k - 1] <= e[k - 1]:
-            return 1
-        if trend == -1 and h[k - 1] >= e[k - 1]:
-            return -1
-    if k == force_bar and n_tr == 0:
-        return trend
-    return 0
+# ---------------- SETUPS ----------------
+# signal(k, W, n_tr) -> None or (direction, stop_price, target_price)
+# Entry is at the OPEN of candle k; only candles before k may be used.
+def sig_sweep(k, W, n_tr):
+    """S1 liquidity sweep: wick beyond previous day high/low, close back inside -> fade."""
+    if k < 1:
+        return None
+    o, h, l, c, datr = W["o"], W["h"], W["l"], W["c"], W["datr"]
+    entry = o[k]
+    if h[k - 1] > W["pdh"] and c[k - 1] < W["pdh"]:
+        sl = h[k - 1] + SWEEP_BUFFER * datr
+        risk = sl - entry
+        if RISK_MIN * datr <= risk <= RISK_MAX * datr:
+            return -1, sl, entry - RR * risk
+    if l[k - 1] < W["pdl"] and c[k - 1] > W["pdl"]:
+        sl = l[k - 1] - SWEEP_BUFFER * datr
+        risk = entry - sl
+        if RISK_MIN * datr <= risk <= RISK_MAX * datr:
+            return 1, sl, entry + RR * risk
+    return None
 
 
-def run(wins, sl_m, tp_m, span, force_bar):
+def sig_orb(k, W, n_tr):
+    """S2 London opening-range breakout (one trade per day)."""
+    mod = W["mod"]
+    if n_tr >= 1 or k < 1 or mod[k - 1] < ORB_END:
+        return None
+    sel = (mod[:k] >= ORB_START) & (mod[:k] < ORB_END)
+    if sel.sum() < 2:
+        return None
+    rh, rl = W["h"][:k][sel].max(), W["l"][:k][sel].min()
+    datr, entry, c1 = W["datr"], W["o"][k], W["c"][k - 1]
+    if not (ORB_WIDTH_MIN * datr <= rh - rl <= ORB_WIDTH_MAX * datr):
+        return None
+    if c1 > rh:
+        risk = entry - rl
+        if risk > 0 and risk <= 0.8 * datr:
+            return 1, rl, entry + RR * risk
+    if c1 < rl:
+        risk = rh - entry
+        if risk > 0 and risk <= 0.8 * datr:
+            return -1, rh, entry - RR * risk
+    return None
+
+
+def sig_vwap(k, W, n_tr):
+    """S3 VWAP mean reversion: stretched from VWAP + rejection candle -> target VWAP."""
+    if k < VW_MIN_BAR:
+        return None
+    datr, entry = W["datr"], W["o"][k]
+    vw, c1, o1 = W["vwap"][k - 1], W["c"][k - 1], W["o"][k - 1]
+    dev = (c1 - vw) / datr
+    risk = VW_SL * datr
+    if dev >= VW_DEV and c1 < o1 and entry - vw >= risk:
+        return -1, entry + risk, vw
+    if dev <= -VW_DEV and c1 > o1 and vw - entry >= risk:
+        return 1, entry - risk, vw
+    return None
+
+
+SETUPS = {
+    "S1_liquidity_sweep": sig_sweep,
+    "S2_london_orb": sig_orb,
+    "S3_vwap_reversion": sig_vwap,
+}
+
+
+# ---------------- ENGINE ----------------
+def run(wins, signal_fn):
     trades = []
     for W in wins:
-        o, h, l, c, e = W["o"], W["h"], W["l"], W["c"], W["e"][span]
-        datr, trend, idx = W["datr"], W["trend"], W["idx"]
+        o, h, l, c, idx = W["o"], W["h"], W["l"], W["c"], W["idx"]
         m, k, n_tr = len(o), 0, 0
         while k < m and n_tr < MAX_TRADES_PER_DAY:
-            d = entry_dir(k, h, l, e, trend, force_bar, n_tr)
-            if d == 0:
+            sig = signal_fn(k, W, n_tr)
+            if sig is None:
                 k += 1
                 continue
+            d, sl, tp = sig
             entry = o[k]
-            if not np.isfinite(entry) or entry <= 0 or not datr > 0:
+            valid = np.isfinite(entry) and entry > 0 and (
+                (d == 1 and sl < entry < tp) or (d == -1 and tp < entry < sl))
+            if not valid:
                 k += 1
                 continue
-            sl = entry - d * sl_m * datr
-            tp = entry + d * tp_m * datr
-            risk_pct = sl_m * datr / entry
+            risk_pct = abs(entry - sl) / entry
             exit_px, j = c[m - 1], m - 1          # default: close at window end
             for jj in range(k, m):
                 hit_sl = l[jj] <= sl if d == 1 else h[jj] >= sl
@@ -231,6 +291,12 @@ def stats(t, n_windows):
                 cov=days_with / n_windows, tpd=len(t) / n_windows)
 
 
+def fmt(name, tag, s):
+    return (f"{name:19s} {tag:4s} n={s['trades']:4d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
+            f"expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}% "
+            f"trades/day={s['tpd']:.2f} days_traded={s['cov']*100:.0f}%")
+
+
 # ---------------- MAIN ----------------
 def main():
     raw, src = load_data()
@@ -240,62 +306,27 @@ def main():
     nw_oos = len(wins) - nw_is
     print(f"{len(wins)} daily windows | in-sample {nw_is} days | out-of-sample {nw_oos} days "
           f"(from {split_time.date()})")
-    print(f"Round-trip cost {COST*100:.3f}% (fee {FEE*100:.2f}% + {GST*100:.0f}% GST, slip {SLIP*100:.2f}% per side)")
+    print(f"Round-trip cost {COST*100:.3f}% (fee {FEE*100:.2f}% + {GST*100:.0f}% GST, "
+          f"slip {SLIP*100:.2f}% per side)\n")
 
-    combos = list(itertools.product(SL_GRID, TP_GRID, SPAN_GRID, FORCE_GRID))
-    print(f"Testing {len(combos)} parameter combos...\n")
-
-    res = []
-    for sl_m, tp_m, span, force in combos:
-        t = run(wins, sl_m, tp_m, span, force)
+    lines, passed = [], []
+    for name, fn in SETUPS.items():
+        t = run(wins, fn)
         t_is, t_oos = t[t.time < split_time], t[t.time >= split_time]
-        res.append(dict(p=(sl_m, tp_m, span, force), s_all=stats(t, len(wins)),
-                        s_is=stats(t_is, nw_is), s_oos=stats(t_oos, nw_oos)))
+        s_all, s_is, s_oos = stats(t, len(wins)), stats(t_is, nw_is), stats(t_oos, nw_oos)
+        for tag, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
+            print(fmt(name, tag, s))
+        print()
+        ok = (s_all["trades"] >= MIN_TRADES and s_all["pf"] >= MIN_PF and s_oos["pf"] >= MIN_OOS_PF)
+        if ok:
+            passed.append(name)
+        lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} win={s_all['win']:.0f}% "
+                     f"PF={s_all['pf']:.2f} IS={s_is['pf']:.2f} OOS={s_oos['pf']:.2f} "
+                     f"days={s_all['cov']*100:.0f}% ret={s_all['ret']:+.1f}%")
 
-    # how much of the grid is profitable at all (luck check)
-    pf_is = np.array([r["s_is"]["pf"] for r in res])
-    pf_oos = np.array([r["s_oos"]["pf"] for r in res])
-    share_is = (pf_is > 1).mean() * 100
-    share_oos = (pf_oos > 1).mean() * 100
-    share_both = ((pf_is > 1) & (pf_oos > 1)).mean() * 100
-    print(f"Combos with PF>1: in-sample {share_is:.0f}% | out-of-sample {share_oos:.0f}% | both {share_both:.0f}%")
-    print(f"Median PF: in-sample {np.median(pf_is):.2f} | out-of-sample {np.median(pf_oos):.2f}\n")
-
-    # rank by IN-SAMPLE profit factor only
-    cands = [r for r in res if r["s_is"]["trades"] >= MIN_IS_TRADES and r["s_all"]["cov"] >= MIN_COVERAGE]
-    cands.sort(key=lambda r: r["s_is"]["pf"], reverse=True)
-    top = cands[:8]
-
-    print("Top 8 by in-sample PF (SL, TP, EMA, force-bar):")
-    for r in top:
-        sl_m, tp_m, span, force = r["p"]
-        a, i, o = r["s_all"], r["s_is"], r["s_oos"]
-        print(f"SL{sl_m} TP{tp_m} EMA{span} F{force} | IS PF {i['pf']:.2f} | OOS PF {o['pf']:.2f} | "
-              f"win {a['win']:.0f}% | n {a['trades']} | tr/day {a['tpd']:.2f} | days {a['cov']*100:.0f}% | "
-              f"ret {a['ret']:+.1f}% | dd {a['maxdd']:.1f}%")
-
-    if not top:
-        summary = (f"BTC daily-window tuning (setup C) {DAYS}d ({src})\n"
-                   f"No combo had enough trades/coverage.\nPF>1 in-sample {share_is:.0f}% | OOS {share_oos:.0f}%")
-        print("\n" + summary)
-        notify("Backtest result", summary)
-        return
-
-    best = top[0]
-    sl_m, tp_m, span, force = best["p"]
-    i, o, a = best["s_is"], best["s_oos"], best["s_all"]
-    ok = (i["trades"] >= MIN_IS_TRADES and i["pf"] >= MIN_IS_PF and o["pf"] >= MIN_OOS_PF
-          and a["cov"] >= MIN_COVERAGE)
-    verdict = "PASS" if ok else "FAIL"
-
-    summary = (
-        f"BTC daily-window tuning (setup C) {DAYS}d {TF_MIN}m ({src})\n"
-        f"Tested {len(combos)} combos | PF>1 in-sample {share_is:.0f}%, OOS {share_oos:.0f}%, both {share_both:.0f}%\n"
-        f"Best in-sample: SL{sl_m} TP{tp_m} EMA{span} F{force}\n"
-        f"{verdict}: IS PF {i['pf']:.2f} | OOS PF {o['pf']:.2f} | win {a['win']:.0f}% | "
-        f"n={a['trades']} | days {a['cov']*100:.0f}% | ret {a['ret']:+.1f}% | dd {a['maxdd']:.1f}%"
-    )
-    print("\n" + summary)
+    summary = (f"BTC new-concept backtest {DAYS}d {TF_MIN}m ({src})\n" + "\n".join(lines)
+               + f"\nPassed {len(passed)}/{len(SETUPS)}")
+    print(summary)
     notify("Backtest result", summary)
 
 
@@ -307,4 +338,4 @@ if __name__ == "__main__":
     except Exception as ex:          # any crash also goes to ntfy
         notify("Backtest ERROR", f"{type(ex).__name__}: {ex}"[:500])
         raise
-    
+ 
