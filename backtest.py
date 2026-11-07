@@ -1,14 +1,13 @@
 """
-BTCUSD backtest - 3 NEW setups built on different concepts (no trend/EMA logic):
-  S1  Liquidity sweep reversal : wick takes the previous day's high/low, closes back inside -> fade it
-  S2  London opening-range breakout : breakout of the 12:30-13:30 IST range
-  S3  VWAP mean reversion : stretched from the daily-anchored VWAP + rejection candle -> back to VWAP
+BTC backtest - 3 setups from DERIVATIVES POSITIONING data (not price patterns):
+  D1  Funding extreme (contrarian)  : crowded longs/shorts -> trade against the crowd
+  D2  Liquidation flush (reversal)  : big forced-liquidation spike on a candle -> fade the flush
+  D3  OI squeeze fade               : big price move while open interest FALLS (positions closing,
+                                      no new money) -> fade the move
 
-Window = 06:00 IST -> next day 06:00 IST (00:30 UTC -> 00:30 UTC). Max 2 trades a day.
-Setups only trade when their condition appears, so some days have no trade.
-Parameters are FIXED (no grid search), so only 3 tests are run - less room for luck.
-
-Data: Delta Exchange public candles (no key), fallback Bybit.
+Data: Coinalyze history (price, open interest, funding, liquidations) from ONE exchange perp.
+Needs env COINALYZE_KEY.  Coinalyze only keeps a limited amount of intraday history,
+so the script uses 4h candles and prints how many days it really got.
 Result goes to ntfy via env NTFY_TOPIC.
 """
 import os
@@ -20,34 +19,38 @@ import pandas as pd
 import requests
 
 # ---------------- CONFIG (change numbers here) ----------------
-SYMBOL = "BTCUSD"
-DAYS = 730             # history length
-TF_MIN = 30            # candle size in minutes
+DAYS = 730             # history requested (Coinalyze returns what it keeps, usually less)
+INTERVAL = "4hour"     # Coinalyze interval: 1hour, 2hour, 4hour, 6hour, 12hour, daily
+BAR_HOURS = 4
 FEE = 0.0002           # 0.02% per side (Delta fee)
 GST = 0.18             # 18% GST on the fee -> effective 0.0236% per side
 SLIP = 0.0001          # 0.01% slippage per side (set 0 if you only use limit orders)
 RISK_PER_TRADE = 0.01  # 1% of equity risked per trade (equity curve only)
 MAX_TRADES_PER_DAY = 2
 OOS_SPLIT = 0.70       # first 70% in-sample, last 30% out-of-sample
-WINDOW_START_UTC_MIN = 30   # 06:00 IST = 00:30 UTC
 
-# setup parameters (x = multiple of the average daily range, "datr")
-RR = 1.5               # reward : risk for S1 and S2
-SWEEP_BUFFER = 0.05    # S1: stop sits this far beyond the sweep wick
-RISK_MIN, RISK_MAX = 0.10, 0.60   # S1/S2: skip trades whose stop is outside this range
-ORB_START, ORB_END = 420, 480     # S2: 07:00-08:00 UTC = 12:30-13:30 IST (London open), minutes of day
-ORB_WIDTH_MIN, ORB_WIDTH_MAX = 0.08, 0.60
-VW_DEV = 0.35          # S3: price must be this far from VWAP
-VW_SL = 0.25           # S3: stop distance
-VW_MIN_BAR = 6         # S3: wait 3 hours after window start so VWAP is stable
+# trade management (x ATR of the 4h candle)
+SL_ATR = 1.5
+TP_ATR = 2.0
+MAX_HOLD = 6           # close after 6 candles (24h) if neither SL nor TP hit
 
-# pass rules
-MIN_TRADES = 120
-MIN_PF = 1.2
-MIN_OOS_PF = 1.05
+# setup parameters (fixed, no grid search)
+FUND_LOOKBACK = 60     # D1: funding z-score window (candles)
+FUND_Z = 2.0           # D1: |z| needed
+LIQ_LOOKBACK = 30      # D2: average liquidation window
+LIQ_MULT = 3.0         # D2: spike must be this many x the average
+OI_LOOKBACK = 60       # D3: OI change z-score window
+OI_Z = -1.0            # D3: OI change z-score must be below this (positions closing)
+MOVE_ATR = 2.0         # D3: price move over last 3 candles, in ATR
 
-BARS_PER_DAY = 24 * 60 // TF_MIN
+# pass rules (small sample, so be strict)
+MIN_TRADES = 60
+MIN_PF = 1.3
+MIN_OOS_PF = 1.1
+
 COST = 2 * (FEE * (1 + GST) + SLIP)   # round-trip cost as a fraction of price
+API = "https://api.coinalyze.net/v1"
+KEY = (os.getenv("COINALYZE_KEY") or "").strip()
 
 
 # ---------------- NTFY ----------------
@@ -65,266 +68,216 @@ def notify(title, message):
         print("ntfy failed:", ex)
 
 
-# ---------------- DATA ----------------
-def fetch_delta(base):
-    end = int(time.time())
-    start = end - DAYS * 86400
-    step = 1500 * TF_MIN * 60
-    rows, s = [], start
-    while s < end:
-        e = min(s + step, end)
-        r = requests.get(
-            f"{base}/v2/history/candles",
-            params={"resolution": f"{TF_MIN}m", "symbol": SYMBOL, "start": s, "end": e},
-            timeout=30,
-        )
+# ---------------- DATA (Coinalyze) ----------------
+def api_get(path, params=None, tries=6):
+    p = dict(params or {})
+    p["api_key"] = KEY
+    for _ in range(tries):
+        r = requests.get(f"{API}/{path}", params=p, headers={"api_key": KEY}, timeout=60)
+        if r.status_code == 429:
+            try:
+                wait = float(r.headers.get("Retry-After", "10"))
+            except ValueError:
+                wait = 10
+            time.sleep(wait + 1)
+            continue
         r.raise_for_status()
-        rows += r.json()["result"]
-        s = e
-    df = pd.DataFrame(rows)
-    df["time"] = pd.to_datetime(df["time"], unit="s")
-    return df[["time", "open", "high", "low", "close", "volume"]]
+        return r.json()
+    raise RuntimeError(f"{path}: still rate limited after retries")
 
 
-def fetch_bybit():
-    end = int(time.time() * 1000)
-    start = end - DAYS * 86400 * 1000
-    rows, cur_end = [], end
-    while cur_end > start:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "linear", "symbol": "BTCUSDT", "interval": str(TF_MIN),
-                    "end": cur_end, "limit": 1000},
-            timeout=30,
-        )
-        r.raise_for_status()
-        lst = r.json()["result"]["list"]
-        if not lst:
-            break
-        rows += lst
-        cur_end = int(lst[-1][0]) - 1
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
-    df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
-    return df[["time", "open", "high", "low", "close", "volume"]]
+def pick_symbol():
+    markets = api_get("future-markets")
+    btc = [m for m in markets if m.get("base_asset") == "BTC" and m.get("is_perpetual")
+           and m.get("quote_asset") in ("USDT", "USD")]
+    pref = ([m for m in btc if m.get("exchange") == "A" and m.get("quote_asset") == "USDT"]
+            or [m for m in btc if m.get("quote_asset") == "USDT"] or btc)
+    if not pref:
+        raise RuntimeError("No BTC perpetual market found on Coinalyze")
+    print(f"Using symbol {pref[0]['symbol']}")
+    return pref[0]["symbol"]
+
+
+def history(path, symbol, extra=None):
+    now = int(time.time())
+    params = {"symbols": symbol, "interval": INTERVAL, "from": now - DAYS * 86400, "to": now}
+    params.update(extra or {})
+    data = api_get(path, params)
+    time.sleep(2)                                   # stay under the rate limit
+    hist = data[0]["history"] if data else []
+    if not hist:
+        raise RuntimeError(f"{path}: empty history")
+    df = pd.DataFrame(hist)
+    df.index = pd.to_datetime(df["t"], unit="s")
+    return df.drop(columns=["t"]).sort_index()
+
+
+def load_data():
+    if not KEY:
+        notify("Backtest FAILED", "COINALYZE_KEY is empty. Add it as a repo secret and in the yml env.")
+        sys.exit("COINALYZE_KEY missing")
+    symbol = pick_symbol()
+    px = history("ohlcv-history", symbol)[["o", "h", "l", "c", "v"]]
+    px.columns = ["open", "high", "low", "close", "volume"]
+    df = px.copy()
+    missing = []
+    for col, path, extra, pick, names in [
+        ("oi", "open-interest-history", {"convert_to_usd": "true"}, ["c"], ["oi"]),
+        ("fund", "funding-rate-history", {}, ["c"], ["fund"]),
+        ("liq", "liquidation-history", {"convert_to_usd": "true"}, ["l", "s"], ["liq_long", "liq_short"]),
+    ]:
+        try:
+            x = history(path, symbol, extra)[pick]
+            x.columns = names
+            df = df.join(x, how="left")
+        except Exception as ex:
+            print(f"{path} failed: {ex}")
+            missing.append(path)
+    return clean(df), symbol, missing
 
 
 def clean(df):
-    """Drop bad candles (zeros, NaN, broken highs/lows, crazy spikes)."""
     n0 = len(df)
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
-    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
-    df = df[df["high"] >= df["low"]].copy()
+    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)].copy()
     df["high"] = df[["high", "open", "close"]].max(axis=1)
     df["low"] = df[["low", "open", "close"]].min(axis=1)
-    df["volume"] = df["volume"].fillna(0).clip(lower=0)
+    for col in ["oi", "fund"]:
+        if col in df:
+            df[col] = df[col].ffill()
+    for col in ["liq_long", "liq_short"]:
+        if col in df:
+            df[col] = df[col].fillna(0).clip(lower=0)
     jump = (df["close"] / df["close"].shift() - 1).abs()
     df = df[~(jump > 0.2)]
     print(f"Cleaned {n0 - len(df)} bad candles out of {n0}")
     return df
 
 
-def load_data():
-    for name, fn in [
-        ("Delta global", lambda: fetch_delta("https://api.delta.exchange")),
-        ("Delta India", lambda: fetch_delta("https://api.india.delta.exchange")),
-        ("Bybit", fetch_bybit),
-    ]:
-        try:
-            df = fn()
-            if len(df) > 2000:
-                print(f"Data source: {name}, {len(df)} candles")
-                df = df.drop_duplicates("time").sort_values("time").set_index("time")
-                return clean(df.astype(float)), name
-        except Exception as ex:
-            print(f"{name} failed: {ex}")
-    notify("Backtest FAILED", "No data source worked (Delta/Bybit). Check the workflow log.")
-    sys.exit("No data source worked")
+# ---------------- FEATURES / SETUPS ----------------
+def atr(df, n=14):
+    pc = df["close"].shift()
+    tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
-# ---------------- PREP ----------------
-def prepare(df):
-    df = df.copy()
-    df["win"] = (df.index - pd.Timedelta(minutes=WINDOW_START_UTC_MIN)).floor("D")
-    g = df.groupby("win")
-    w = pd.DataFrame({
-        "open": g["open"].first(), "high": g["high"].max(),
-        "low": g["low"].min(), "close": g["close"].last(), "n": g.size(),
-    })
-    w = w[w["n"] >= int(BARS_PER_DAY * 0.9)]          # full windows only
-    w["datr"] = (w["high"] - w["low"]).rolling(14).mean().shift(1)   # avg daily range known at start
-    w["pdh"] = w["high"].shift(1)                                    # previous window high
-    w["pdl"] = w["low"].shift(1)                                     # previous window low
-
-    wins = []
-    for win, wi in w.iterrows():
-        if np.isnan(wi["datr"]) or np.isnan(wi["pdh"]):
-            continue
-        seg = df[df["win"] == win]
-        h, l, c, v = (seg[x].values for x in ["high", "low", "close", "volume"])
-        if v.sum() <= 0:
-            v = np.ones_like(v)
-        typ = (h + l + c) / 3
-        vwap = np.cumsum(typ * v) / np.cumsum(v)           # VWAP anchored at window start
-        wins.append(dict(
-            win=win, idx=seg.index, datr=wi["datr"], pdh=wi["pdh"], pdl=wi["pdl"],
-            o=seg["open"].values, h=h, l=l, c=c, vwap=vwap,
-            mod=(seg.index.hour * 60 + seg.index.minute).values,
-        ))
-    return wins, w
+def zscore(s, n):
+    return (s - s.rolling(n).mean()) / s.rolling(n).std().replace(0, np.nan)
 
 
-# ---------------- SETUPS ----------------
-# signal(k, W, n_tr) -> None or (direction, stop_price, target_price)
-# Entry is at the OPEN of candle k; only candles before k may be used.
-def sig_sweep(k, W, n_tr):
-    """S1 liquidity sweep: wick beyond previous day high/low, close back inside -> fade."""
-    if k < 1:
-        return None
-    o, h, l, c, datr = W["o"], W["h"], W["l"], W["c"], W["datr"]
-    entry = o[k]
-    if h[k - 1] > W["pdh"] and c[k - 1] < W["pdh"]:
-        sl = h[k - 1] + SWEEP_BUFFER * datr
-        risk = sl - entry
-        if RISK_MIN * datr <= risk <= RISK_MAX * datr:
-            return -1, sl, entry - RR * risk
-    if l[k - 1] < W["pdl"] and c[k - 1] > W["pdl"]:
-        sl = l[k - 1] - SWEEP_BUFFER * datr
-        risk = entry - sl
-        if RISK_MIN * datr <= risk <= RISK_MAX * datr:
-            return 1, sl, entry + RR * risk
-    return None
+# each setup returns (long_signal, short_signal) evaluated at the CLOSE of a candle;
+# the trade enters at the OPEN of the next candle.
+def setup_d1_funding(df, a):
+    z = zscore(df["fund"], FUND_LOOKBACK)
+    return z <= -FUND_Z, z >= FUND_Z          # very negative funding -> long, very positive -> short
 
 
-def sig_orb(k, W, n_tr):
-    """S2 London opening-range breakout (one trade per day)."""
-    mod = W["mod"]
-    if n_tr >= 1 or k < 1 or mod[k - 1] < ORB_END:
-        return None
-    sel = (mod[:k] >= ORB_START) & (mod[:k] < ORB_END)
-    if sel.sum() < 2:
-        return None
-    rh, rl = W["h"][:k][sel].max(), W["l"][:k][sel].min()
-    datr, entry, c1 = W["datr"], W["o"][k], W["c"][k - 1]
-    if not (ORB_WIDTH_MIN * datr <= rh - rl <= ORB_WIDTH_MAX * datr):
-        return None
-    if c1 > rh:
-        risk = entry - rl
-        if risk > 0 and risk <= 0.8 * datr:
-            return 1, rl, entry + RR * risk
-    if c1 < rl:
-        risk = rh - entry
-        if risk > 0 and risk <= 0.8 * datr:
-            return -1, rh, entry - RR * risk
-    return None
+def setup_d2_liquidation(df, a):
+    spike_long = df["liq_long"] > LIQ_MULT * df["liq_long"].rolling(LIQ_LOOKBACK).mean().shift()
+    spike_short = df["liq_short"] > LIQ_MULT * df["liq_short"].rolling(LIQ_LOOKBACK).mean().shift()
+    red, green = df["close"] < df["open"], df["close"] > df["open"]
+    return spike_long & red, spike_short & green   # longs flushed on a red candle -> buy, etc.
 
 
-def sig_vwap(k, W, n_tr):
-    """S3 VWAP mean reversion: stretched from VWAP + rejection candle -> target VWAP."""
-    if k < VW_MIN_BAR:
-        return None
-    datr, entry = W["datr"], W["o"][k]
-    vw, c1, o1 = W["vwap"][k - 1], W["c"][k - 1], W["o"][k - 1]
-    dev = (c1 - vw) / datr
-    risk = VW_SL * datr
-    if dev >= VW_DEV and c1 < o1 and entry - vw >= risk:
-        return -1, entry + risk, vw
-    if dev <= -VW_DEV and c1 > o1 and vw - entry >= risk:
-        return 1, entry - risk, vw
-    return None
+def setup_d3_oi_squeeze(df, a):
+    oi_z = zscore(df["oi"].pct_change(), OI_LOOKBACK)
+    move = (df["close"] - df["close"].shift(3)) / a
+    closing = oi_z <= OI_Z
+    return closing & (move <= -MOVE_ATR), closing & (move >= MOVE_ATR)   # fade moves made on falling OI
 
 
 SETUPS = {
-    "S1_liquidity_sweep": sig_sweep,
-    "S2_london_orb": sig_orb,
-    "S3_vwap_reversion": sig_vwap,
+    "D1_funding_extreme": (setup_d1_funding, ["fund"]),
+    "D2_liquidation_flush": (setup_d2_liquidation, ["liq_long", "liq_short"]),
+    "D3_oi_squeeze_fade": (setup_d3_oi_squeeze, ["oi"]),
 }
 
 
 # ---------------- ENGINE ----------------
-def run(wins, signal_fn):
-    trades = []
-    for W in wins:
-        o, h, l, c, idx = W["o"], W["h"], W["l"], W["c"], W["idx"]
-        m, k, n_tr = len(o), 0, 0
-        while k < m and n_tr < MAX_TRADES_PER_DAY:
-            sig = signal_fn(k, W, n_tr)
-            if sig is None:
-                k += 1
-                continue
-            d, sl, tp = sig
-            entry = o[k]
-            valid = np.isfinite(entry) and entry > 0 and (
-                (d == 1 and sl < entry < tp) or (d == -1 and tp < entry < sl))
-            if not valid:
-                k += 1
-                continue
-            risk_pct = abs(entry - sl) / entry
-            exit_px, j = c[m - 1], m - 1          # default: close at window end
-            for jj in range(k, m):
-                hit_sl = l[jj] <= sl if d == 1 else h[jj] >= sl
-                hit_tp = h[jj] >= tp if d == 1 else l[jj] <= tp
-                if hit_sl:                         # SL first if both in one candle (conservative)
-                    exit_px, j = sl, jj
-                    break
-                if hit_tp:
-                    exit_px, j = tp, jj
-                    break
-            net = d * (exit_px - entry) / entry - COST
-            R = net / risk_pct
-            if np.isfinite(R):
-                trades.append((idx[k], d, net, R))
-            n_tr += 1
-            k = j + 1
+def simulate(df, long, short, a):
+    o, h, l, c = (df[k].values for k in ["open", "high", "low", "close"])
+    ls, ss, av = long.fillna(False).values, short.fillna(False).values, a.values
+    idx, n = df.index, len(df)
+    trades, per_day, i = [], {}, 0
+    while i < n - 2:
+        d = 1 if ls[i] else (-1 if ss[i] else 0)
+        if d == 0 or not np.isfinite(av[i]) or av[i] <= 0:
+            i += 1
+            continue
+        day = idx[i + 1].floor("D")
+        if per_day.get(day, 0) >= MAX_TRADES_PER_DAY:
+            i += 1
+            continue
+        entry = o[i + 1]
+        sl, tp = entry - d * SL_ATR * av[i], entry + d * TP_ATR * av[i]
+        risk_pct = SL_ATR * av[i] / entry
+        last = min(i + MAX_HOLD, n - 1)
+        exit_px, j = c[last], last                  # default: close after max hold
+        for jj in range(i + 1, last + 1):
+            hit_sl = l[jj] <= sl if d == 1 else h[jj] >= sl
+            hit_tp = h[jj] >= tp if d == 1 else l[jj] <= tp
+            if hit_sl:                              # SL first if both in one candle (conservative)
+                exit_px, j = sl, jj
+                break
+            if hit_tp:
+                exit_px, j = tp, jj
+                break
+        net = d * (exit_px - entry) / entry - COST
+        R = net / risk_pct
+        if np.isfinite(R):
+            trades.append((idx[i + 1], d, net, R))
+            per_day[day] = per_day.get(day, 0) + 1
+        i = j
     return pd.DataFrame(trades, columns=["time", "dir", "net_pct", "R"])
 
 
-def stats(t, n_windows):
-    if t is None or len(t) == 0 or n_windows == 0:
-        return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0, cov=0, tpd=0)
+def stats(t, n_days):
+    if t is None or len(t) == 0 or n_days == 0:
+        return dict(trades=0, win=0, pf=0, exp_R=0, ret=0, maxdd=0, cov=0)
     wins, losses = t.loc[t.R > 0, "R"].sum(), -t.loc[t.R <= 0, "R"].sum()
     pf = wins / losses if losses > 0 else float("inf")
     eq = (1 + RISK_PER_TRADE * t.R).cumprod()
     dd = (eq / eq.cummax() - 1).min()
-    days_with = t["time"].dt.floor("D").nunique()
     return dict(trades=len(t), win=(t.R > 0).mean() * 100, pf=pf, exp_R=t.R.mean(),
                 ret=(eq.iloc[-1] - 1) * 100, maxdd=dd * 100,
-                cov=days_with / n_windows, tpd=len(t) / n_windows)
+                cov=t["time"].dt.floor("D").nunique() / n_days)
 
 
 def fmt(name, tag, s):
-    return (f"{name:19s} {tag:4s} n={s['trades']:4d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
-            f"expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}% "
-            f"trades/day={s['tpd']:.2f} days_traded={s['cov']*100:.0f}%")
+    return (f"{name:21s} {tag:4s} n={s['trades']:4d} win={s['win']:3.0f}% PF={s['pf']:.2f} "
+            f"expR={s['exp_R']:+.2f} ret={s['ret']:+.1f}% dd={s['maxdd']:.1f}% days_traded={s['cov']*100:.0f}%")
 
 
 # ---------------- MAIN ----------------
 def main():
-    raw, src = load_data()
-    wins, w = prepare(raw)
-    split_time = wins[int(len(wins) * OOS_SPLIT)]["win"]
-    nw_is = sum(1 for x in wins if x["win"] < split_time)
-    nw_oos = len(wins) - nw_is
-    print(f"{len(wins)} daily windows | in-sample {nw_is} days | out-of-sample {nw_oos} days "
-          f"(from {split_time.date()})")
-    print(f"Round-trip cost {COST*100:.3f}% (fee {FEE*100:.2f}% + {GST*100:.0f}% GST, "
-          f"slip {SLIP*100:.2f}% per side)\n")
+    df, symbol, missing = load_data()
+    a = atr(df)
+    n_days = df.index.floor("D").nunique()
+    split_time = df.index[int(len(df) * OOS_SPLIT)]
+    d_is = df.index[df.index < split_time].floor("D").nunique()
+    print(f"{symbol}: {len(df)} candles ({INTERVAL}), {n_days} days, {df.index[0]} -> {df.index[-1]}")
+    print(f"Out-of-sample from {split_time}. Round-trip cost {COST*100:.3f}%\n")
 
     lines, passed = [], []
-    for name, fn in SETUPS.items():
-        t = run(wins, fn)
+    for name, (fn, needs) in SETUPS.items():
+        if any(col not in df for col in needs):
+            print(f"{name}: skipped (data missing: {missing})\n")
+            lines.append(f"SKIP {name}: data not available")
+            continue
+        long, short = fn(df, a)
+        t = simulate(df, long, short, a)
         t_is, t_oos = t[t.time < split_time], t[t.time >= split_time]
-        s_all, s_is, s_oos = stats(t, len(wins)), stats(t_is, nw_is), stats(t_oos, nw_oos)
+        s_all, s_is, s_oos = stats(t, n_days), stats(t_is, d_is), stats(t_oos, n_days - d_is)
         for tag, s in [("ALL", s_all), ("IS", s_is), ("OOS", s_oos)]:
             print(fmt(name, tag, s))
         print()
-        ok = (s_all["trades"] >= MIN_TRADES and s_all["pf"] >= MIN_PF and s_oos["pf"] >= MIN_OOS_PF)
+        ok = s_all["trades"] >= MIN_TRADES and s_all["pf"] >= MIN_PF and s_oos["pf"] >= MIN_OOS_PF
         if ok:
             passed.append(name)
         lines.append(f"{'PASS' if ok else 'FAIL'} {name}: n={s_all['trades']} win={s_all['win']:.0f}% "
-                     f"PF={s_all['pf']:.2f} IS={s_is['pf']:.2f} OOS={s_oos['pf']:.2f} "
-                     f"days={s_all['cov']*100:.0f}% ret={s_all['ret']:+.1f}%")
+                     f"PF={s_all['pf']:.2f} IS={s_is['pf']:.2f} OOS={s_oos['pf']:.2f} ret={s_all['ret']:+.1f}%")
 
-    summary = (f"BTC new-concept backtest {DAYS}d {TF_MIN}m ({src})\n" + "\n".join(lines)
+    summary = (f"BTC derivatives backtest {INTERVAL} | {n_days} days of data\n" + "\n".join(lines)
                + f"\nPassed {len(passed)}/{len(SETUPS)}")
     print(summary)
     notify("Backtest result", summary)
@@ -338,4 +291,4 @@ if __name__ == "__main__":
     except Exception as ex:          # any crash also goes to ntfy
         notify("Backtest ERROR", f"{type(ex).__name__}: {ex}"[:500])
         raise
- 
+      
