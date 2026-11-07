@@ -18,8 +18,9 @@ import requests
 SYMBOL = "BTCUSD"
 DAYS = 730             # history length
 TF_MIN = 30            # candle size in minutes
-FEE = 0.0005           # 0.05% per side
-SLIP = 0.0001          # 0.01% per side
+FEE = 0.0002           # 0.02% per side (Delta fee)
+GST = 0.18             # 18% GST charged on the fee -> effective fee = FEE x 1.18 = 0.0236% per side
+SLIP = 0.0001          # 0.01% slippage per side (set 0 if you only use limit orders)
 SL_MULT = 0.5          # stop   = 0.5 x average daily range
 TP_MULT = 0.3          # target = 0.3 x average daily range (smaller TP = higher win rate)
 RISK_PER_TRADE = 0.01  # 1% of equity risked per trade (equity curve only)
@@ -186,7 +187,7 @@ SETUPS = {
 def run(df, w, entry_fn):
     groups = {k: v for k, v in df.groupby("win")}
     trades, n_windows = [], 0
-    cost = 2 * (FEE + SLIP)
+    cost = 2 * (FEE * (1 + GST) + SLIP)
     for win, wi in w.iterrows():
         if np.isnan(wi["datr"]) or win not in groups:
             continue
@@ -255,7 +256,7 @@ def main():
     df, w = prepare(raw)
     split_time = w.index[int(len(w) * OOS_SPLIT)]
     print(f"Range {w.index[0]} -> {w.index[-1]} | {len(w)} daily windows | OOS from {split_time}")
-    print(f"SL {SL_MULT}x / TP {TP_MULT}x daily range | fee {FEE*100:.3f}% slip {SLIP*100:.3f}% per side\n")
+    print(f"SL {SL_MULT}x / TP {TP_MULT}x daily range | fee {FEE*100:.2f}% + {GST*100:.0f}% GST = {FEE*(1+GST)*100:.4f}% | slip {SLIP*100:.3f}% per side\n")
 
     lines, passed = [], []
     for name, fn in SETUPS.items():
@@ -294,4 +295,3 @@ if __name__ == "__main__":
     except Exception as ex:          # any crash also goes to ntfy
         notify("Backtest ERROR", f"{type(ex).__name__}: {ex}"[:500])
         raise
-    
